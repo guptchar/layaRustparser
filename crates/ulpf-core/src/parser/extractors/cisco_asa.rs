@@ -1,5 +1,6 @@
 use chrono::Utc;
 use regex::Regex;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -423,7 +424,15 @@ fn normalize_direction(dir: &str) -> String {
     }
 }
 
-/// Parses an endpoint string of the form "interface:ip/port", "ip/port", "interface:ip", or "ip".
+/// Parses an endpoint string of the form "interface:ip/port", "ip/port",
+/// "interface:ip", "ip", "[v6]/port" or "interface:[v6]/port".
+///
+/// Colon disambiguation: the port splits off the LAST '/' first (slashes
+/// never occur in IPs). What remains is an interface prefix only if it is
+/// NOT itself an IP literal — `2001:db8::1` parses as an address, so a
+/// bare IPv6 endpoint keeps `default_intf` instead of gaining a
+/// bogus interface like "2001". Single-colon `name:v4` keeps the old
+/// first-colon split (unchanged fast path for IPv4 lines).
 fn parse_endpoint_str(
     text: &str,
     default_intf: Option<&str>,
@@ -431,22 +440,41 @@ fn parse_endpoint_str(
     let clean = text
         .trim()
         .trim_matches(|c: char| c == '(' || c == ')' || c == '[' || c == ']');
-    let (intf, rest) = if let Some(colon_pos) = clean.find(':') {
-        let (i, r) = clean.split_at(colon_pos);
-        (Some(i.to_string()), &r[1..])
-    } else {
-        (default_intf.map(|s| s.to_string()), clean)
+
+    let (hostpart, port) = match clean.rsplit_once('/') {
+        Some((h, p)) => (h, p.parse::<u16>().ok()),
+        None => (clean, None),
     };
 
-    let (ip, port) = if let Some(slash_pos) = rest.find('/') {
-        let (ip_part, port_part) = rest.split_at(slash_pos);
-        let port = port_part[1..].parse::<u16>().ok();
-        (Some(ip_part.to_string()), port)
+    // Brackets never occur in interface names or IPs: syslog `[v6]`
+    // wrapping (and the lone trailing `]` left when edge-trim ate the
+    // opening bracket before this split) must go before the IP check,
+    // or `[2001:db8::5]` fails it and `2001` becomes an interface.
+    // Gated on presence: clean lines keep borrowing, allocate nothing.
+    let hostpart: Cow<str> = if hostpart.contains(['[', ']']) {
+        Cow::Owned(hostpart.replace(['[', ']'], ""))
     } else {
-        (Some(rest.to_string()), None)
+        Cow::Borrowed(hostpart)
     };
+    let hostpart = hostpart.as_ref();
 
-    (ip, port, intf)
+    if hostpart.contains(':') && hostpart.parse::<std::net::IpAddr>().is_ok() {
+        // Bare IP literal (v4-mapped or IPv6): no interface prefix.
+        (
+            Some(hostpart.to_string()),
+            port,
+            default_intf.map(|s| s.to_string()),
+        )
+    } else if let Some(colon_pos) = hostpart.find(':') {
+        let (i, r) = hostpart.split_at(colon_pos);
+        (Some(r[1..].to_string()), port, Some(i.to_string()))
+    } else {
+        (
+            Some(hostpart.to_string()),
+            port,
+            default_intf.map(|s| s.to_string()),
+        )
+    }
 }
 
 #[cfg(test)]

@@ -812,3 +812,108 @@ fn test_paloalto_quoted_csv_with_escaped_quotes() {
     assert_eq!(event.dst_endpoint.port, Some(80));
     assert_eq!(event.disposition, disposition::ALLOWED);
 }
+
+// ============================================================================
+// P11.2 IPv6 sweep (RED first): every vendor must carry IPv6 endpoints
+// exactly. Bare `2001:db8::5/5555` breaks naive first-colon splits
+// (interface vs address); these tests pin the correct split.
+// ============================================================================
+
+#[test]
+fn test_asa_ipv6_denied_endpoints() {
+    let parser = UniversalParser::new();
+    // 106001 carries BARE ip/port (no interface prefix) — first-colon
+    // splitting mangles IPv6 here; the trailing `interface outside`
+    // supplies the default interface instead.
+    let raw = "%ASA-2-106001: Inbound TCP connection denied from 2001:db8::5/5555 to 2001:db8:1::2/80 flags SYN on interface outside";
+    let event = parser.parse(raw).expect("parse asa ipv6 deny");
+    assert_eq!(event.src_endpoint.ip.as_deref(), Some("2001:db8::5"));
+    assert_eq!(event.src_endpoint.port, Some(5555));
+    assert_eq!(
+        event.src_endpoint.interface.as_deref(),
+        Some("outside"),
+        "default interface wins; '2001' is never an interface"
+    );
+    assert_eq!(event.dst_endpoint.ip.as_deref(), Some("2001:db8:1::2"));
+    assert_eq!(event.dst_endpoint.port, Some(80));
+    assert_eq!(event.disposition, disposition::DROPPED);
+    assert_eq!(
+        event.metadata.raw_hash,
+        hex::encode(Sha256::digest(raw.as_bytes()))
+    );
+}
+
+#[test]
+fn test_asa_bracketed_ipv6_endpoints() {
+    let parser = UniversalParser::new();
+    // Bracketed forms: `outside:[2001:db8::57]/80` (built) and bare
+    // `[2001:db8::5]/5555` (106001). Edge-trim eats the opening bracket
+    // before the port split, so the hostpart must shed brackets itself —
+    // otherwise the IP check fails and `2001` becomes an interface.
+    let raw = "%ASA-6-302013: Built inbound TCP connection 1004583 for outside:[2001:db8::57]/80 to inside:[2001:db8:1::9]/443";
+    let event = parser.parse(raw).expect("parse asa bracketed ipv6");
+    assert_eq!(event.src_endpoint.ip.as_deref(), Some("2001:db8::57"));
+    assert_eq!(event.src_endpoint.port, Some(80));
+    assert_eq!(event.src_endpoint.interface.as_deref(), Some("outside"));
+    assert_eq!(event.dst_endpoint.ip.as_deref(), Some("2001:db8:1::9"));
+    assert_eq!(event.dst_endpoint.port, Some(443));
+
+    let raw2 = "%ASA-2-106001: Inbound TCP connection denied from [2001:db8::5]/5555 to [2001:db8:1::2]/80 flags SYN on interface outside";
+    let event2 = parser.parse(raw2).expect("parse asa bare bracketed ipv6");
+    assert_eq!(event2.src_endpoint.ip.as_deref(), Some("2001:db8::5"));
+    assert_eq!(event2.src_endpoint.port, Some(5555));
+    assert_eq!(event2.src_endpoint.interface.as_deref(), Some("outside"));
+    assert_eq!(event2.dst_endpoint.ip.as_deref(), Some("2001:db8:1::2"));
+    assert_eq!(
+        event2.metadata.raw_hash,
+        hex::encode(Sha256::digest(raw2.as_bytes()))
+    );
+}
+
+#[test]
+fn test_fortigate_ipv6_endpoints() {
+    let parser = UniversalParser::new();
+    let raw = "date=2023-10-15 time=10:20:30 devname=\"FGT60D\" logid=\"0000000013\" type=\"traffic\" srcip=2001:db8::5 srcport=51234 dstip=2001:db8:1::9 dstport=443 proto=6 action=accept policyid=1";
+    let event = parser.parse(raw).expect("parse fortigate ipv6");
+    assert_eq!(event.src_endpoint.ip.as_deref(), Some("2001:db8::5"));
+    assert_eq!(event.src_endpoint.port, Some(51234));
+    assert_eq!(event.dst_endpoint.ip.as_deref(), Some("2001:db8:1::9"));
+    assert_eq!(event.dst_endpoint.port, Some(443));
+    assert_eq!(event.disposition, disposition::ALLOWED);
+    assert_eq!(
+        event.metadata.raw_hash,
+        hex::encode(Sha256::digest(raw.as_bytes()))
+    );
+}
+
+#[test]
+fn test_paloalto_ipv6_endpoints() {
+    let parser = UniversalParser::new();
+    let raw = "1,2023/10/15 10:20:30,001801000000,TRAFFIC,start,0,2023/10/15 10:20:30,2001:db8::50,2001:db8:2::25,2001:db8::50,2001:db8:2::25,allow-web,user1,,web-browsing,vsys1,trust,untrust,ethernet1/2,ethernet1/1,log-forwarding,0,12345,1,54321,443,0,0,0x0,tcp,allow,1024,512,512,10,2023/10/15 10:20:30,15,any,0,1234567,0x0";
+    let event = parser.parse(raw).expect("parse pan-os ipv6");
+    assert_eq!(event.src_endpoint.ip.as_deref(), Some("2001:db8::50"));
+    assert_eq!(event.src_endpoint.port, Some(54321));
+    assert_eq!(event.dst_endpoint.ip.as_deref(), Some("2001:db8:2::25"));
+    assert_eq!(event.dst_endpoint.port, Some(443));
+    assert_eq!(event.disposition, disposition::ALLOWED);
+    assert_eq!(
+        event.metadata.raw_hash,
+        hex::encode(Sha256::digest(raw.as_bytes()))
+    );
+}
+
+#[test]
+fn test_cef_ipv6_endpoints() {
+    let parser = UniversalParser::new();
+    let raw = "CEF:0|Fortinet|FortiGate|v7.0.2|0000000019|traffic:forward accept|3|src=2001:db8::5 spt=25297 dst=2001:db8:1::9 dpt=443 proto=6 act=accept";
+    let event = parser.parse(raw).expect("parse cef ipv6");
+    assert_eq!(event.src_endpoint.ip.as_deref(), Some("2001:db8::5"));
+    assert_eq!(event.src_endpoint.port, Some(25297));
+    assert_eq!(event.dst_endpoint.ip.as_deref(), Some("2001:db8:1::9"));
+    assert_eq!(event.dst_endpoint.port, Some(443));
+    assert_eq!(event.disposition, disposition::ALLOWED);
+    assert_eq!(
+        event.metadata.raw_hash,
+        hex::encode(Sha256::digest(raw.as_bytes()))
+    );
+}
