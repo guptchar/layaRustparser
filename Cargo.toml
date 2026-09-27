@@ -37,7 +37,12 @@ socket2 = { version = "0.6", features = ["all"] }
 bytes = "1.0"
 libc = "0.2"
 # Maintained, pure-Rust, #![forbid(unsafe_code)] YAML (serde drop-in).
-# Chosen over `serde_yaml`, which is DEPRECATED (RUSTSEC-2025-0068) and pulls
-# the libyaml C-FFI — both unacceptable for an air-gapped, <35MB binary.
+# Chosen over `serde_yaml` 0.9, which crates.io marks DEPRECATED and whose docs
+# say "This project is no longer maintained" — it will never be patched. It also
+# depends on `unsafe-libyaml`, a mechanical C->Rust transpilation of libyaml: not
+# a C-FFI (no C toolchain needed), but C-derived and full of `unsafe`. Worth
+# knowing where the usual migration leads: RUSTSEC-2025-0068 (unsound, segfault
+# in the emitter) is against `serde_yml`, the ARCHIVED FORK people moved TO from
+# `serde_yaml`. Neither `unsafe-libyaml` nor that fork is maintained.
 # `default-features = false` drops the unused `strict-deserialise` (serde_ignored).
 noyalib = { version = "0.0.51", default-features = false, features = ["std"] }

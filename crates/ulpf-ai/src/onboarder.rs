@@ -3,7 +3,7 @@ use chrono::Utc;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
@@ -26,8 +26,20 @@ pub struct ValidationReport {
 /// Dynamically generated and exportable parser definition.
 ///
 /// `regex_cache` is excluded from serde (YAML/JSON) — it is a runtime-only
-/// compiled-regex cache. `Clone` is manual because `OnceLock<Regex>` is not
-/// `Clone`; wrapping in `Arc` lets clones share the same cached regex.
+/// compiled-regex cache.
+///
+/// # Why `Clone` and `PartialEq` are hand-written
+///
+/// `regex_cache` is `Arc<OnceLock<Result<Regex, regex::Error>>>`. `OnceLock`
+/// implements neither `Clone` nor `PartialEq`, and `Arc<T>` inherits both
+/// limits, so neither can be derived. `Clone` is implemented by hand and
+/// deliberately hands out a **fresh, empty** cell rather than a clone of the
+/// warm one — see [`ParserDefinition::clone`]. There is no `PartialEq` impl at
+/// all: comparing two definitions field-by-field while ignoring the cache would
+/// claim they are equal when one is holding a compiled regex and the other is
+/// not, and comparing the caches would compare `regex::Error` values. Callers
+/// that need equality should compare the serialized form, which is what
+/// actually round-trips.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ParserDefinition {
     pub vendor: String,
@@ -136,11 +148,14 @@ impl ParserDefinition {
         // `Endpoint` has no hostname field, so a non-address was never a valid
         // value here — accepting one was silently corrupting the store.
         //
-        // Cost: measured ~250 ns/event in release (two `IpAddr::from_str`) on
-        // a ~1.2 us call, i.e. the novel-vendor dynamic route. Only unknown
-        // shapes reach this path, and it buys a guarantee that no event is
-        // ever filed under a fabricated address. Revisit only alongside a
-        // cheaper address check, never by dropping the check.
+        // Cost: two `IpAddr::from_str` calls, measured once at ~250 ns/event in
+        // release on a ~1.2 us call — i.e. the novel-vendor dynamic route, not
+        // the line-rate hot path (that is Tier-1's `SignatureLruCache`, and it
+        // never reaches here). Treat the figure as a one-off measurement on one
+        // machine, not a committed benchmark. Only unknown shapes get this far,
+        // and it buys a guarantee that no event is ever filed under a fabricated
+        // address. Revisit only alongside a cheaper address check, never by
+        // dropping the check.
         let src_ip_raw = caps.name("src_ip").map(|m| m.as_str());
         if let Some(s) = src_ip_raw {
             if parse_ip(s).is_none() {
@@ -344,10 +359,16 @@ impl __VENDOR____MODEL__Extractor {
 pub struct Onboarder;
 
 impl Onboarder {
-    /// Analyze 3–5 sample lines of an unknown perimeter device log,
+    /// Analyze sample lines of an unknown perimeter device log,
     /// synthesize a non-greedy compiled regex with named capture groups,
-    /// perform sandbox validation (≥95% extraction pass rate with warnings),
-    /// and produce an exportable `ParserDefinition`.
+    /// perform sandbox validation, and produce an exportable
+    /// `ParserDefinition`.
+    ///
+    /// At least 3 samples are required. The 95% pass-rate threshold is only a
+    /// genuine 95% from 20 samples up: the rule is `failed <= total / 20`, so
+    /// below 20 it allows zero failures and is effectively a 100% requirement.
+    /// Supplying fewer samples is not wrong, it just buys no relaxation —
+    /// which is why `ulpf onboard` reads up to 25 rather than a handful.
     pub fn generate_parser(
         vendor: &str,
         device_model: &str,
@@ -654,13 +675,12 @@ impl Onboarder {
         // zero parsers. `is_ip`/`is_ip_port` reject it and it falls through to
         // `(?:\S+)`, so the timestamp branch below only ever sees a
         // DATE-prefixed column (`re_timestamp` requires `\d{4}-\d{2}-\d{2}`).
-        // `parse_ip` is also the only way to tell a bare IPv6 address
-        // (`2001:db8::1`) from the ambiguous `IP:port` form: both are legal IPv6
-        // *and* legal host:port strings, so a complete-valid-IP check must come
-        // first.
-        // `addr:port` shape whose address half really parses, AND which is not
-        // itself a complete address (`2001:db8::1` and `::443` are legal both
-        // ways, so the whole-token check must come first).
+        // `parse_ip` is also the only thing that can separate a bare IPv6
+        // address from the ambiguous `addr:port` form: `2001:db8::1` and
+        // `::443` are legal readings on BOTH sides, so neither a character class
+        // nor a colon count can decide it. Only "does this whole token parse as
+        // an address" can — hence the complete-valid-address check running
+        // before the split is even attempted.
         let is_ip_port = |token: &str| {
             parse_ip(token).is_none()
                 && re_ip_port
@@ -681,9 +701,35 @@ impl Onboarder {
         }
 
         let mut parts = Vec::new();
+        // Which endpoint/port *slot* the next column fills. These pick the
+        // preferred name; `taken` below decides whether it is still available.
         let mut ip_count = 0;
         let mut port_count = 0;
-        let mut has_timestamp = false;
+
+        // A capture-group name may appear AT MOST ONCE in a pattern: `Regex::new`
+        // rejects duplicates outright, so a second `src_port` does not degrade
+        // the capture, it makes the whole pattern uncompilable — and
+        // `validate_parser` then rejects the pattern the synthesizer just
+        // produced, failing onboarding on a log shape the user cannot see the
+        // problem with. Every branch below therefore routes through `take`,
+        // which downgrades a repeat to a non-capturing group. Per-branch
+        // counters alone cannot see the collision: a standalone `443` column
+        // and a `10.0.0.1:1000` column both want `src_port`, and they are
+        // counted independently.
+        let mut taken: HashSet<&'static str> = HashSet::new();
+        let mut take = |name: &'static str, body: &str| -> String {
+            if taken.insert(name) {
+                format!("(?P<{name}>{body})")
+            } else {
+                format!("(?:{body})")
+            }
+        };
+
+        // Class bodies for captured columns. Deliberately loose — the
+        // classifier above already proved the training tokens are real
+        // addresses, and `IpAddr::from_str` re-checks at parse time.
+        const IP_BODY: &str = "[0-9a-fA-F.:%]+";
+        const PORT_BODY: &str = r"\d{1,5}";
 
         for i in 0..min_len {
             let col: Vec<&str> = split_lines.iter().map(|l| l[i]).collect();
@@ -693,68 +739,58 @@ impl Onboarder {
                 // Static anchor token: escape special regex characters
                 parts.push(regex::escape(col[0]));
             } else if col.iter().all(|t| re_timestamp.is_match(t)) {
-                // Date column. Name only the FIRST one: a second date column
-                // (start/end) would emit a duplicate `timestamp` group, and a
-                // pattern with duplicate names fails to compile — which
-                // `validate_parser` would then reject as an unparseable
-                // definition.
-                if has_timestamp {
-                    parts.push(r"(?:\S+)".to_string());
-                } else {
-                    parts.push(r"(?P<timestamp>\S+)".to_string());
-                    has_timestamp = true;
-                }
+                parts.push(take("timestamp", r"\S+"));
             } else if col.iter().all(|t| is_ip_port(t)) {
                 // Genuine `IP:port` / `IP/port`, where the address half really
                 // parses AND the whole token is not itself a valid address (so
                 // `2001:db8::1` and `::443` stay whole bare IPv6 captures).
                 let delimiter = if col[0].contains(':') { ":" } else { "/" };
-                if ip_count == 0 {
-                    parts.push(format!(
-                        r"(?P<src_ip>[0-9a-fA-F.:%]+){}(?P<src_port>\d{{1,5}})",
-                        delimiter
-                    ));
-                    ip_count += 1;
-                    port_count += 1;
-                } else if ip_count == 1 {
-                    parts.push(format!(
-                        r"(?P<dst_ip>[0-9a-fA-F.:%]+){}(?P<dst_port>\d{{1,5}})",
-                        delimiter
-                    ));
+                if ip_count < 2 {
+                    let (ip_name, port_name) = if ip_count == 0 {
+                        ("src_ip", "src_port")
+                    } else {
+                        ("dst_ip", "dst_port")
+                    };
+                    // Either name may already be spent by an earlier column of
+                    // the other kind; `take` downgrades just that half, so the
+                    // address is still captured even when its port is not.
+                    let ip = take(ip_name, IP_BODY);
+                    let port = take(port_name, PORT_BODY);
+                    parts.push(format!("{ip}{delimiter}{port}"));
                     ip_count += 1;
                     port_count += 1;
                 } else {
-                    // 3rd+ ip/port column: NEVER reuse a capture-group name —
-                    // duplicate names make the regex fail to compile.
-                    parts.push(format!(r"[0-9a-fA-F.:%]+{}\d{{1,5}}", delimiter));
+                    parts.push(format!(r"{IP_BODY}{delimiter}\d{{1,5}}"));
                 }
             } else if col.iter().all(|t| re_port.is_match(t)) {
-                // MUST precede the IP branch: the loose IP class includes
-                // 0-9, so `443` matches re_ip too. Testing IP first made this
-                // branch dead and silently dropped standalone port columns.
-                if port_count == 0 {
-                    parts.push(r"(?P<src_port>\d{1,5})".to_string());
-                    port_count += 1;
-                } else if port_count == 1 {
-                    parts.push(r"(?P<dst_port>\d{1,5})".to_string());
+                // Order relative to the IP branches is not load-bearing for
+                // correctness — `is_ip` is real address validation, so `443` is
+                // simply not an address. It is kept ahead of them so a port
+                // column is classified as a port instead of falling through to
+                // the generic non-capturing fallback.
+                if port_count < 2 {
+                    let name = if port_count == 0 {
+                        "src_port"
+                    } else {
+                        "dst_port"
+                    };
+                    parts.push(take(name, PORT_BODY));
                     port_count += 1;
                 } else {
                     parts.push(r"(?:\d{1,5})".to_string());
                 }
             } else if col.iter().all(|t| is_ip(t)) {
-                if ip_count == 0 {
-                    parts.push(r"(?P<src_ip>[0-9a-fA-F.:%]+)".to_string());
-                    ip_count += 1;
-                } else if ip_count == 1 {
-                    parts.push(r"(?P<dst_ip>[0-9a-fA-F.:%]+)".to_string());
+                if ip_count < 2 {
+                    let name = if ip_count == 0 { "src_ip" } else { "dst_ip" };
+                    parts.push(take(name, IP_BODY));
                     ip_count += 1;
                 } else {
-                    parts.push(r"[0-9a-fA-F.:%]+".to_string());
+                    parts.push(IP_BODY.to_string());
                 }
             } else if col.iter().all(|t| re_proto.is_match(t)) {
-                parts.push(r"(?P<protocol>[a-zA-Z0-9]+)".to_string());
+                parts.push(take("protocol", r"[a-zA-Z0-9]+"));
             } else if col.iter().all(|t| re_action.is_match(t)) {
-                parts.push(r"(?P<action>[a-zA-Z]+)".to_string());
+                parts.push(take("action", r"[a-zA-Z]+"));
             } else {
                 parts.push(r"(?:\S+)".to_string());
             }
@@ -811,8 +847,10 @@ pub struct DynamicParserRegistry {
     clock: u64,
     capacity: usize,
     /// Count of registrations whose `regex_pattern` failed to compile. Those
-    /// entries are stored but can never parse, so the count is surfaced on the
-    /// health surface rather than silently degrading the hot path.
+    /// entries are stored but can never parse, so the count is a local
+    /// diagnostic: nothing in the serve plane reads it. `GET /parsers` reports
+    /// the same condition per-parser, as `status: "invalid"`, which is the
+    /// surface an operator actually sees.
     failed_registrations: u64,
 }
 
@@ -1056,6 +1094,113 @@ mod tests {
         }
     }
 
+    /// A capture-group name may appear at most once per pattern. `Regex::new`
+    /// rejects duplicates outright, so a repeat does not degrade a capture — it
+    /// makes the pattern uncompilable, and `validate_parser` then rejects the
+    /// pattern the synthesizer just produced.
+    ///
+    /// The dangerous case is two column *kinds* competing for one name. A
+    /// standalone `443` column and a `10.0.0.1:1000` column both want
+    /// `src_port`, and they are counted by independent counters, so per-branch
+    /// counting cannot see the collision. Every branch routes through one
+    /// `take` budget instead, and the second claimant is downgraded to a
+    /// non-capturing group.
+    #[test]
+    fn test_positional_synthesizer_never_emits_duplicate_group_names() {
+        // Each case is a real log shape whose columns collide on a name.
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            (
+                "standalone port column, then addr:port columns",
+                vec![
+                    "host 443 10.0.0.1:1000 10.0.0.2:2000 TCP accept",
+                    "host 444 10.0.0.3:1001 10.0.0.4:2001 TCP accept",
+                    "host 445 10.0.0.5:1002 10.0.0.6:2002 TCP accept",
+                ],
+            ),
+            (
+                "addr:port column, then a standalone port column",
+                vec![
+                    "10.0.0.1:1000 22 10.0.0.2:2000 TCP accept",
+                    "10.0.0.3:1001 23 10.0.0.4:2001 TCP accept",
+                    "10.0.0.5:1002 24 10.0.0.6:2002 TCP accept",
+                ],
+            ),
+            (
+                "two varying date columns",
+                vec![
+                    "2026-09-21 2026-09-22 10.0.0.1 10.0.0.2 TCP accept",
+                    "2026-09-23 2026-09-24 10.0.0.3 10.0.0.4 TCP accept",
+                    "2026-09-25 2026-09-26 10.0.0.5 10.0.0.6 TCP accept",
+                ],
+            ),
+            (
+                "two varying protocol columns",
+                vec![
+                    "10.0.0.1 10.0.0.2 ESP AH accept",
+                    "10.0.0.3 10.0.0.4 TCP GRE accept",
+                    "10.0.0.5 10.0.0.6 UDP ESP accept",
+                ],
+            ),
+            (
+                "two varying action columns",
+                vec![
+                    "10.0.0.1 10.0.0.2 TCP accept deny",
+                    "10.0.0.3 10.0.0.4 TCP drop block",
+                    "10.0.0.5 10.0.0.6 TCP pass reject",
+                ],
+            ),
+        ];
+
+        for (label, samples) in cases {
+            let pattern =
+                Onboarder::synthesize_regex(&samples).unwrap_or_else(|e| panic!("{label}: {e}"));
+            Regex::new(&pattern).unwrap_or_else(|e| {
+                panic!("{label} produced an uncompilable pattern: {e}\n  {pattern}")
+            });
+            // Compiling is not enough — the pattern must also survive the
+            // validator, or onboarding fails on the user's own samples.
+            let def = ParserDefinition {
+                vendor: "v".into(),
+                device_model: "m".into(),
+                regex_pattern: pattern,
+                action_mappings: HashMap::new(),
+                sample_logs: vec![],
+                confidence_score: 1.0,
+                created_at: 0,
+                regex_cache: Arc::new(OnceLock::new()),
+            };
+            let report = Onboarder::validate_parser(&def, &samples)
+                .unwrap_or_else(|e| panic!("{label}: validator errored: {e}"));
+            assert!(
+                report.passed,
+                "{label}: pattern must validate against its own samples: {:?}",
+                report.errors
+            );
+        }
+    }
+
+    /// Downgrading a repeat capture must not lose the OTHER half of the pair. A
+    /// standalone port column spends `src_port`; the following `addr:port`
+    /// column must still capture its ADDRESS even though its port name is gone.
+    #[test]
+    fn test_duplicate_name_downgrade_keeps_the_other_capture() {
+        let samples = vec![
+            "host 443 10.0.0.1:1000 10.0.0.2:2000 TCP accept",
+            "host 444 10.0.0.3:1001 10.0.0.4:2001 TCP accept",
+            "host 445 10.0.0.5:1002 10.0.0.6:2002 TCP accept",
+        ];
+        let pattern = Onboarder::synthesize_regex(&samples).unwrap();
+        let re = Regex::new(&pattern).unwrap();
+        let caps = re.captures(samples[0]).unwrap();
+        // The standalone column owns src_port.
+        assert_eq!(caps.name("src_port").map(|m| m.as_str()), Some("443"));
+        // The addr:port column still yields its address — dropping the whole
+        // column to a non-capturing group would be a silent field loss.
+        assert_eq!(caps.name("src_ip").map(|m| m.as_str()), Some("10.0.0.1"));
+        assert_eq!(caps.name("dst_ip").map(|m| m.as_str()), Some("10.0.0.2"));
+        assert_eq!(caps.name("dst_port").map(|m| m.as_str()), Some("2000"));
+    }
+
     /// A positional format with 3+ ip/port columns must never reuse a capture
     /// group name (duplicate `dst_port` names made Regex::new fail at validation).
     #[test]
@@ -1293,6 +1438,13 @@ mod tests {
     /// The legacy fixture is the old emitter's output verbatim — double-quoted
     /// scalars, 2-decimal `confidence_score`, bare integer `created_at`,
     /// `sample_logs` as a quoted list.
+    ///
+    /// `regex_pattern` carries a backslash, which every synthesized pattern
+    /// does. Note the `\\\\` in the Rust literal below: the old emitter doubled
+    /// backslashes when writing, and a YAML double-quoted scalar needs the
+    /// doubling to survive — a bare `\d` there is an *invalid escape* and no
+    /// YAML parser can read the file. The loader has to turn `\\d` back into
+    /// `\d` or it loads a different regex than the one on disk.
     #[test]
     fn test_from_yaml_loads_legacy_emitter_output_and_json() {
         let legacy = concat!(
@@ -1300,21 +1452,23 @@ mod tests {
             "device_model: \"FortiGate\"\n",
             "confidence_score: 1.00\n",
             "created_at: 1700000000000\n",
-            "regex_pattern: \"^src=(?P<src_ip>[0-9.]+) dst=(?P<dst_ip>[0-9.]+)$\"\n",
+            "regex_pattern: \"^src=(?P<src_ip>[0-9.]+) dst=(?P<dst_port>\\\\d{1,5})$\"\n",
             "action_mappings:\n",
             "  pass: \"Allowed\"\n",
             "  deny: \"Blocked\"\n",
             "sample_logs:\n",
-            "  - \"src=10.0.0.1 dst=10.0.0.2\"\n",
-            "  - \"src=10.0.0.3 dst=10.0.0.4\"\n",
+            "  - \"src=10.0.0.1 dst=22\"\n",
+            "  - \"src=10.0.0.3 dst=443\"\n",
         );
         let def = ParserDefinition::from_yaml(legacy)
             .expect("a YAML file published by a previous release must still load");
         assert_eq!(def.vendor, "Fortinet");
         assert_eq!(def.device_model, "FortiGate");
+        // The doubled backslash in the file must decode to ONE backslash, or
+        // the loaded pattern is a different regex from the one on disk.
         assert_eq!(
             def.regex_pattern,
-            r"^src=(?P<src_ip>[0-9.]+) dst=(?P<dst_ip>[0-9.]+)$"
+            r"^src=(?P<src_ip>[0-9.]+) dst=(?P<dst_port>\d{1,5})$"
         );
         assert_eq!(
             def.action_mappings.get("deny").map(String::as_str),
@@ -1325,9 +1479,10 @@ mod tests {
         assert_eq!(def.created_at, 1_700_000_000_000);
         // And it must be usable, not merely parseable.
         let ev = def
-            .parse("src=10.0.0.1 dst=10.0.0.2")
+            .parse("src=10.0.0.1 dst=22")
             .expect("a legacy-loaded definition must still parse");
         assert_eq!(ev.src_endpoint.ip.as_deref(), Some("10.0.0.1"));
+        assert_eq!(ev.dst_endpoint.port, Some(22));
 
         // `to_json` output is valid YAML, and the old loader relied on that.
         let json = def.to_json().unwrap();
@@ -1335,6 +1490,58 @@ mod tests {
             .expect("JSON is a YAML subset; from_yaml must keep accepting it");
         assert_eq!(from_json_as_yaml.regex_pattern, def.regex_pattern);
         assert_eq!(from_json_as_yaml.sample_logs, def.sample_logs);
+    }
+
+    /// A sample log containing backslashes must survive the YAML round trip
+    /// BYTE-FOR-BYTE.
+    ///
+    /// The emitter this replaced hand-escaped `sample_logs` with only
+    /// `replace('"', "\\\"")`, so a backslash was written raw into a
+    /// double-quoted YAML scalar — where it is an *escape*, not a literal. Two
+    /// distinct failures follow, both observed against a real YAML parser:
+    ///
+    /// - SILENT CORRUPTION: `C:\temp\fw.log` comes back as `C:<TAB>emp<CR>fw.log`,
+    ///   because `\t` and `\r` are valid escapes. The file parses fine and the
+    ///   stored sample is simply wrong — the worst outcome, since nothing fails.
+    /// - HARD REJECTION: `C:\data\fw.log` and `proto=T \d denied` produce a
+    ///   document no YAML parser will read, because `\d` is not an escape at all.
+    ///
+    /// `regex_pattern` was escaped correctly; only `sample_logs` was not. The
+    /// first assertion is the load-bearing one — a serializer that round-trips
+    /// is the only thing standing between a Windows firewall path and a
+    /// quietly altered training sample.
+    #[test]
+    fn test_yaml_roundtrip_preserves_backslashes_in_sample_logs() {
+        let samples = vec![
+            r"C:\temp\fw.log blocked".to_string(),
+            r"proto=T \d denied".to_string(),
+            r#"tab\there and "quoted""#.to_string(),
+            r#"trailing backslash \"#.to_string(),
+            String::new(),
+            r"a\b\c\d\e\f\g".to_string(),
+        ];
+        let parser = ParserDefinition {
+            vendor: "windows".into(),
+            device_model: "wf".into(),
+            // Also carries a backslash, exercising the other escaping path.
+            regex_pattern: r"^src=(?P<src_ip>\S+)$".to_string(),
+            action_mappings: HashMap::from([("deny".to_string(), "Blocked".to_string())]),
+            sample_logs: samples.clone(),
+            confidence_score: 0.97,
+            created_at: 1_700_000_000_000,
+            regex_cache: Arc::new(OnceLock::new()),
+        };
+
+        let yaml = parser.to_yaml().unwrap();
+        let back = ParserDefinition::from_yaml(&yaml)
+            .unwrap_or_else(|e| panic!("emitted YAML must be loadable: {e:#}\n---\n{yaml}"));
+
+        assert_eq!(
+            back.sample_logs, samples,
+            "sample_logs must round-trip byte-for-byte; the emitted YAML was:\n{yaml}"
+        );
+        assert_eq!(back.regex_pattern, parser.regex_pattern);
+        assert_eq!(back.action_mappings, parser.action_mappings);
     }
 
     /// A file missing fields now FAILS LOUDLY instead of loading as a dead

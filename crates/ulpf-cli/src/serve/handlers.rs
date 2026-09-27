@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Json, Response};
 use chrono::Utc;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::Builder;
@@ -562,25 +563,58 @@ pub async fn get_parsers(State(state): State<AppState>) -> Json<Vec<ParserItem>>
         if let Ok(entries) = std::fs::read_dir(&state.parsers_dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
-                if p.is_file() {
-                    if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
-                        if ext == "json" {
-                            if let Ok(content) = std::fs::read_to_string(&p) {
-                                if let Ok(def) = ParserDefinition::from_json(&content) {
-                                    items.push(ParserItem {
-                                        vendor: def.vendor,
-                                        device_model: def.device_model,
-                                        parser_type: "dynamic_onboarded".to_string(),
-                                        status: "active".to_string(),
-                                        regex_pattern: Some(def.regex_pattern),
-                                        confidence_score: Some(def.confidence_score),
-                                        created_at: Some(def.created_at),
-                                    });
-                                }
+                if !p.is_file() {
+                    continue;
+                }
+                if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                    continue;
+                }
+                // A file that exists but cannot be used is REPORTED, not
+                // skipped. Both failure modes were previously invisible here:
+                // an unparseable file simply vanished from the listing, and a
+                // file whose `regex_pattern` does not compile was listed as
+                // `active` even though it can never match an event. An operator
+                // reading this endpoint has no other way to tell a working
+                // parser from a dead one.
+                let item = match std::fs::read_to_string(&p) {
+                    Err(_) => ParserItem {
+                        vendor: "<unreadable>".to_string(),
+                        device_model: p.display().to_string(),
+                        parser_type: "dynamic_onboarded".to_string(),
+                        status: "unreadable".to_string(),
+                        regex_pattern: None,
+                        confidence_score: None,
+                        created_at: None,
+                    },
+                    Ok(content) => match ParserDefinition::from_json(&content) {
+                        Err(_) => ParserItem {
+                            vendor: "<malformed>".to_string(),
+                            device_model: p.display().to_string(),
+                            parser_type: "dynamic_onboarded".to_string(),
+                            status: "malformed".to_string(),
+                            regex_pattern: None,
+                            confidence_score: None,
+                            created_at: None,
+                        },
+                        Ok(def) => {
+                            let status = if Regex::new(&def.regex_pattern).is_ok() {
+                                "active"
+                            } else {
+                                "invalid"
+                            };
+                            ParserItem {
+                                vendor: def.vendor,
+                                device_model: def.device_model,
+                                parser_type: "dynamic_onboarded".to_string(),
+                                status: status.to_string(),
+                                regex_pattern: Some(def.regex_pattern),
+                                confidence_score: Some(def.confidence_score),
+                                created_at: Some(def.created_at),
                             }
                         }
-                    }
-                }
+                    },
+                };
+                items.push(item);
             }
         }
     }
@@ -647,25 +681,43 @@ pub async fn post_parsers_test(
             .vendor
             .unwrap_or_else(|| "custom_test_device".to_string());
 
-        let parsed_ocsf = if matched {
+        // Reuse the `re` already compiled above instead of recompiling the
+        // same pattern inside the definition's cache.
+        //
+        // `matched` and `parsed_ocsf` are genuinely different questions, and
+        // this response has to answer both. A pattern can match the line and
+        // still fail extraction — most often because a `src_ip`/`dst_ip` group
+        // captured something that is not an address, which `parse_with_regex`
+        // rejects rather than filing the event under a fabricated endpoint. A
+        // bare `parsed_ocsf: null` reads as "no event", so the reason travels
+        // in `notes` instead of being dropped on the floor.
+        let (parsed_ocsf, extraction_error) = if matched {
             let def = ParserDefinition {
                 vendor: vendor.clone(),
                 device_model: "test_model".to_string(),
                 regex_pattern: pattern.clone(),
-                action_mappings: payload.action_mappings.unwrap_or_default(),
+                action_mappings: payload.action_mappings.clone().unwrap_or_default(),
                 sample_logs: vec![raw.to_string()],
                 confidence_score: 1.0,
                 created_at: Utc::now().timestamp_millis(),
                 regex_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
             };
-            // Reuse the `re` already compiled above instead of recompiling
-            // the same pattern inside the definition's cache.
-            def.parse_with_regex(&re, raw).ok()
+            match def.parse_with_regex(&re, raw) {
+                Ok(ev) => (Some(ev), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
         } else {
-            None
+            (None, None)
         };
 
         let duration = start.elapsed().as_secs_f64() * 1_000_000.0;
+        let notes = match extraction_error {
+            Some(reason) => format!(
+                "Ad-hoc regex dry-run (read-only, no disk mutations). The pattern MATCHED the \
+                 line but extraction was REJECTED: {reason}"
+            ),
+            None => "Ad-hoc regex dry-run completed (read-only, no disk mutations)".to_string(),
+        };
         return Ok(Json(ParserTestResponse {
             matched,
             vendor,
@@ -673,7 +725,7 @@ pub async fn post_parsers_test(
             parse_duration_micros: (duration * 10.0).round() / 10.0,
             raw_hash,
             protocol_detected,
-            notes: "Ad-hoc regex dry-run completed (read-only, no disk mutations)".to_string(),
+            notes,
         }));
     }
 
@@ -734,8 +786,31 @@ fn publish_parser_pair(
 
     // Snapshot BEFORE touching anything, so a rollback restores rather than
     // deletes a parser that was already published.
-    let prior_json = std::fs::read(&json_path).ok();
-    let prior_yaml = std::fs::read(&yaml_path).ok();
+    //
+    // Tri-state, deliberately. `read(..).ok()` collapses "no file there" and
+    // "the file is there but unreadable" into the same `None`, and the rollback
+    // below deletes on `None` — so an unreadable existing parser (bad
+    // permissions, transient I/O error) would have been DELETED on failure
+    // rather than restored. The three cases need three answers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Prior {
+        /// Existed; these are its bytes.
+        Present,
+        /// Did not exist, so a rollback should remove whatever landed.
+        Absent,
+        /// Existed but could not be read. Contents unknown — a rollback must
+        /// not guess, and must not delete.
+        Unreadable,
+    }
+    let snapshot = |path: &std::path::Path| -> (Option<Vec<u8>>, Prior) {
+        match std::fs::read(path) {
+            Ok(bytes) => (Some(bytes), Prior::Present),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, Prior::Absent),
+            Err(_) => (None, Prior::Unreadable),
+        }
+    };
+    let (prior_json, state_json) = snapshot(&json_path);
+    let (prior_yaml, state_yaml) = snapshot(&yaml_path);
 
     let tag = format!(
         "tmp-{}-{}",
@@ -764,26 +839,41 @@ fn publish_parser_pair(
 
         drop_temp(std::fs::remove_file(&json_tmp), "temp json");
         drop_temp(std::fs::remove_file(&yaml_tmp), "temp yaml");
-        for (path, prior, renamed, what) in [
-            (&json_path, &prior_json, json_renamed, "json"),
-            (&yaml_path, &prior_yaml, yaml_renamed, "yaml"),
+        for (path, prior, prior_state, renamed, what) in [
+            (&json_path, &prior_json, state_json, json_renamed, "json"),
+            (&yaml_path, &prior_yaml, state_yaml, yaml_renamed, "yaml"),
         ] {
             if !renamed {
                 continue;
             }
-            let r = match prior {
-                Some(bytes) => {
+            match prior_state {
+                Prior::Present => {
+                    let bytes = prior.as_ref().expect("Present implies Some");
                     let restore_tmp = dir.join(format!(
                         "{}.rollback-{tag}",
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ));
-                    std::fs::write(&restore_tmp, bytes)
+                    if let Err(e) = std::fs::write(&restore_tmp, bytes)
                         .and_then(|()| std::fs::rename(&restore_tmp, path))
+                    {
+                        problems.push(format!("{what}: {e}"));
+                    }
                 }
-                None => std::fs::remove_file(path),
-            };
-            if let Err(e) = r {
-                problems.push(format!("{what}: {e}"));
+                Prior::Absent => {
+                    if let Err(e) = std::fs::remove_file(path) {
+                        problems.push(format!("{what}: {e}"));
+                    }
+                }
+                Prior::Unreadable => {
+                    // The prior contents are unknown, so neither restoring nor
+                    // deleting is defensible. Leave the new content in place —
+                    // the file is at least valid — and say the rollback is
+                    // incomplete so the operator knows to reconcile it.
+                    problems.push(format!(
+                        "{what}: could not read the prior file before publishing, so it was \
+                         not restored; it now holds the new definition"
+                    ));
+                }
             }
         }
         if problems.is_empty() {
@@ -1383,6 +1473,79 @@ pub async fn get_export_bundle(
 mod tests {
     use super::*;
 
+    /// `GET /parsers` must not report a parser that cannot work as `active`.
+    ///
+    /// Two failure modes used to be invisible on this endpoint. A file that
+    /// failed to deserialize was skipped entirely, so it simply did not appear
+    /// — indistinguishable from never having been onboarded. And a definition
+    /// whose `regex_pattern` does not compile was listed `active`, even though
+    /// it can never match an event. Both are reported now, and each is
+    /// distinguishable, because an operator reading this endpoint has no other
+    /// way to tell a working parser from a dead one.
+    #[tokio::test]
+    async fn get_parsers_reports_invalid_and_malformed_instead_of_hiding_them() {
+        let dir = scratch_dir("parsers-status");
+
+        let good = ParserDefinition {
+            vendor: "goodco".into(),
+            device_model: "ok".into(),
+            regex_pattern: r"^src=(?P<src_ip>[0-9.]+)$".to_string(),
+            action_mappings: HashMap::new(),
+            sample_logs: vec![],
+            confidence_score: 1.0,
+            created_at: 0,
+            regex_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
+        };
+        std::fs::write(dir.join("good.json"), good.to_json().unwrap()).unwrap();
+
+        // Loads fine, but the pattern cannot compile.
+        std::fs::write(
+            dir.join("broken.json"),
+            br#"{"vendor":"brokenco","device_model":"bx","regex_pattern":"^(?P<src_ip>[unclosed","action_mappings":{},"sample_logs":[],"confidence_score":1.0,"created_at":0}"#,
+        )
+        .unwrap();
+
+        // Does not deserialize at all.
+        std::fs::write(dir.join("malformed.json"), b"{ not json").unwrap();
+
+        // Not a parser file; must stay out of the listing entirely.
+        std::fs::write(dir.join("notes.txt"), b"hello").unwrap();
+
+        let items = get_parsers(State(AppState::new(
+            dir.clone(),
+            dir.join("ledger.jsonl"),
+            dir.clone(),
+            dir.join("eval.md"),
+        )))
+        .await
+        .0;
+        let dynamic: Vec<&ParserItem> = items
+            .iter()
+            .filter(|i| i.parser_type == "dynamic_onboarded")
+            .collect();
+
+        let by_status = |s: &str| {
+            dynamic
+                .iter()
+                .find(|i| i.status == s)
+                .unwrap_or_else(|| panic!("no parser reported status {s:?} in {dynamic:?}"))
+        };
+
+        assert_eq!(by_status("active").vendor, "goodco");
+        assert_eq!(by_status("invalid").vendor, "brokenco");
+        assert_eq!(by_status("malformed").vendor, "<malformed>");
+
+        // Exactly three: the .txt must not be listed, and nothing was skipped
+        // into invisibility.
+        assert_eq!(
+            dynamic.len(),
+            3,
+            "expected good + broken + malformed, got {dynamic:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Fresh temp dir per test (pid-tagged): publish tests must not share
     /// state, and must not touch the repo's real `data/parsers`.
     fn scratch_dir(case: &str) -> std::path::PathBuf {
@@ -1396,14 +1559,17 @@ mod tests {
         dir
     }
 
-    /// No temp files may survive a publish — a leftover `*.tmp-*` is a
-    /// half-published definition the next `GET /parsers` scan could trip on.
+    /// No temp file may survive a publish. A leftover `*.tmp-*` is a staged
+    /// definition that was never published, and a `*.rollback-tmp-*` is a
+    /// staged restore that never landed — both are debris, so the check covers
+    /// both name shapes. `publish_parser_pair` never scans the directory, so
+    /// this is purely an assertion that the cleanup paths ran.
     fn assert_no_tmps(dir: &std::path::Path) {
         let leftovers: Vec<_> = std::fs::read_dir(dir)
             .expect("scratch dir must be listable")
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.contains(".tmp-"))
+            .filter(|n| n.contains("tmp-"))
             .collect();
         assert!(
             leftovers.is_empty(),
@@ -1518,6 +1684,69 @@ mod tests {
             "OLD-JSON",
             "prior contents must be back"
         );
+        assert_no_tmps(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An UNREADABLE prior file must never be deleted by a rollback.
+    ///
+    /// The snapshot used to be `fs::read(..).ok()`, which collapses "no file
+    /// there" and "the file is there but I could not read it" into the same
+    /// `None` — and the rollback deletes on `None`. So a parser that existed
+    /// but was unreadable at snapshot time (bad ownership after a restore from
+    /// another host, a transient I/O error, a file that is not a regular file)
+    /// would have been DELETED when the publish failed, not restored. Losing a
+    /// working parser because an unrelated write failed is the worst possible
+    /// outcome of a rollback.
+    ///
+    /// A unix socket file is the deterministic stand-in for "exists, will not
+    /// read": `read` fails `ENXIO`, which is not `NotFound`, while a rename over
+    /// it succeeds, so the publish really does proceed and really does fail
+    /// afterwards. A `chmod 000` file would be simpler but is unreliable — as
+    /// root it is still readable, and this suite is documented to run as root.
+    #[cfg(unix)]
+    #[test]
+    fn test_publish_pair_never_deletes_an_unreadable_prior_file() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = scratch_dir("unreadable-prior");
+        // Prior "parser" that cannot be read...
+        let json_path = dir.join("fw.json");
+        let listener = UnixListener::bind(&json_path).expect("socket path must be bindable");
+        // ...and a YAML target that cannot be renamed over, to force the
+        // failure that triggers the rollback.
+        std::fs::create_dir(dir.join("fw.yaml")).expect("blocker dir must be creatable");
+
+        let err = publish_parser_pair(&dir, "fw.json", "fw.yaml", "NEW-JSON", "NEW-YAML")
+            .expect_err("blocked YAML rename must fail");
+        let msg = err.to_string();
+
+        assert!(
+            msg.contains("rollback was incomplete"),
+            "an unrestorable prior file must be reported, not swallowed: {msg}"
+        );
+        assert!(
+            msg.contains("could not read the prior file"),
+            "the error must name the reason: {msg}"
+        );
+
+        // The file must still be there, holding the new content. This is the
+        // whole point: a rollback that deleted an unreadable prior file would
+        // leave the path GONE, taking a parser definition with it. Leaving the
+        // new content in place loses nothing that was readable, and the
+        // incompleteness is reported above so an operator can reconcile it.
+        assert!(
+            json_path.exists(),
+            "the prior file was DELETED instead of left in place"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&json_path).unwrap(),
+            "NEW-JSON",
+            "the new content must be intact, not truncated or removed"
+        );
+
+        drop(listener);
+        std::fs::remove_file(&json_path).ok();
         assert_no_tmps(&dir);
         std::fs::remove_dir_all(&dir).ok();
     }

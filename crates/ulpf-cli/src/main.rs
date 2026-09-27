@@ -20,6 +20,18 @@ use ulpf_ai::onboarder::{DynamicParserRegistry, Onboarder};
 use ulpf_ai::pipeline::TieredPipeline;
 use ulpf_core::ingest::socket::{create_tcp_listener, create_udp_socket};
 use ulpf_core::ingest::{BackpressurePolicy, LogQueue, MemoryQueue};
+
+/// Upper bound on sample lines read by `ulpf onboard`.
+///
+/// Deliberately above 20. The validator's threshold is
+/// `failed <= total / 20`, so at 20 samples exactly one failure is tolerated —
+/// a real 95%. At the old cap of 10, `total / 20` is 0 and the rule degrades to
+/// "no failures at all": a 100% requirement wearing a 95% label, with the
+/// relaxation the feature exists to provide unreachable from the CLI. More
+/// samples also make the positional synthesizer's `all_same` heuristic steadier
+/// (more evidence that a column really is static), so the extra headroom is not
+/// free but it is cheap.
+const ONBOARD_MAX_SAMPLES: usize = 25;
 use ulpf_core::parser::UniversalParser;
 use ulpf_core::schema::ocsf::NetworkActivity;
 use ulpf_integrity::batcher::{BatchAccumulator, BatcherConfig, IncomingLog};
@@ -168,7 +180,13 @@ struct VerifyArgs {
 
 #[derive(Args, Debug)]
 struct OnboardArgs {
-    /// Path to text file containing 3-5 sample lines of the new log format
+    /// Path to a text file of sample lines for the new log format.
+    ///
+    /// 3 lines is the minimum. For the validator's 95% pass-rate threshold to
+    /// mean anything you need at least 20 — below that the rule allows zero
+    /// failures and is effectively a 100% requirement, so the relaxation this
+    /// feature exists to provide is unreachable. The cap is set above 20 for
+    /// that reason.
     #[arg(short, long)]
     sample: PathBuf,
 
@@ -1028,7 +1046,7 @@ fn run_onboard(args: OnboardArgs) -> Result<()> {
         .map_while(Result::ok)
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
-        .take(10)
+        .take(ONBOARD_MAX_SAMPLES)
         .collect();
 
     if sample_lines.len() < 3 {
