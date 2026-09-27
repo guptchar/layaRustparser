@@ -583,23 +583,58 @@ enum ParserFormat {
 ///   oversized, not a regular file). Nothing was learned about the contents.
 /// * `"malformed"` — the bytes arrived and are not a `ParserDefinition`.
 ///
-/// Note that `is_file()` is deliberately NOT a pre-filter. It silently drops
-/// exactly the entries worth reporting: a directory or a socket named
-/// `*.json` is not a parser, and that is a finding, not a non-event.
+/// The cap is enforced in FOUR places, because a length check on the path alone
+/// does not bound the read:
+///
+/// 1. `symlink_metadata`, to reject anything that is not a regular file. This is
+///    the one that matters for safety: a FIFO named `*.json` makes a blocking
+///    `read` wait for a writer forever, and this runs inside an async handler,
+///    so one such file parks a tokio worker until the process is killed. A
+///    symlink is refused for the same reason — its target can be anything.
+/// 2. The same `symlink_metadata`, for the size — catches the common case
+///    cheaply, before any allocation.
+/// 3. The OPENED HANDLE's metadata, which is what closes the TOCTOU window:
+///    the path could be swapped for a huge file between the stat and the open.
+/// 4. `Read::take(cap + 1)`, so a file that grew after step 3 still cannot make
+///    the process buffer more than the cap. The `+ 1` is the tell: without it a
+///    file of exactly `cap` bytes and a file of 10 GB read identically.
+///
+/// Still reported rather than skipped. A directory or a socket named `*.json`
+/// is not a parser, and that is a finding, not a non-event — it just must not be
+/// answered by opening it.
 fn load_parser_file(
     path: &std::path::Path,
     format: ParserFormat,
 ) -> Result<ParserDefinition, &'static str> {
-    match std::fs::symlink_metadata(path) {
-        Ok(m) if m.len() > MAX_PARSER_FILE_BYTES => return Err("unreadable"),
-        Ok(_) => {}
-        Err(_) => return Err("unreadable"),
+    // (1) + (2). `file_type()` is checked BEFORE `len()`: for a symlink the
+    // length is the link's own, so a size check alone would wave through a
+    // symlink pointing at anything at all.
+    let meta = std::fs::symlink_metadata(path).map_err(|_| "unreadable")?;
+    if !meta.file_type().is_file() || meta.len() > MAX_PARSER_FILE_BYTES {
+        return Err("unreadable");
     }
-    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
-        // It IS a parser file; its bytes just are not a parser.
-        std::io::ErrorKind::InvalidData => "malformed",
-        _ => "unreadable",
-    })?;
+    // (3) The handle, not the path: what was actually opened is what gets read.
+    let file = std::fs::File::open(path).map_err(|_| "unreadable")?;
+    let opened = file.metadata().map_err(|_| "unreadable")?;
+    if !opened.file_type().is_file() || opened.len() > MAX_PARSER_FILE_BYTES {
+        return Err("unreadable");
+    }
+    // (4) Bounded read. `InvalidData` is the UTF-8 error and is deliberately
+    // distinguished: the bytes DID arrive, they are just not a parser, and the
+    // operator's fix is a content fix rather than a permissions one.
+    use std::io::Read as _;
+    let mut content = String::new();
+    file.take(MAX_PARSER_FILE_BYTES + 1)
+        .read_to_string(&mut content)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::InvalidData => "malformed",
+            _ => "unreadable",
+        })?;
+    // A file that fills the budget exactly and still has more behind it is
+    // over the cap, and reporting it as a parser would be a lie about why.
+    if content.len() as u64 > MAX_PARSER_FILE_BYTES {
+        return Err("unreadable");
+    }
     match format {
         ParserFormat::Json => ParserDefinition::from_json(&content),
         ParserFormat::Yaml => ParserDefinition::from_yaml(&content),
@@ -1677,6 +1712,101 @@ mod tests {
             b.status, "malformed",
             "non-UTF-8 bytes are bad content, not an I/O fault: {b:?}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The size cap must bound the READ, not just the stat.
+    ///
+    /// `MAX_PARSER_FILE_BYTES` was originally enforced as a single
+    /// `symlink_metadata().len()` check, which bounds nothing:
+    ///
+    /// * a **symlink** passes the check on the LINK's own length, so a 1-byte
+    ///   `*.json` symlink could point at any file at all — including one the
+    ///   process has no business reading;
+    /// * a **FIFO** reports `len() == 0`, and reading one BLOCKS until a writer
+    ///   appears. `get_parsers` is an `async fn`, so that is a blocking read
+    ///   inside a tokio worker: one stray `mkfifo x.json` parks that thread
+    ///   until the process is killed, and the UI stops answering;
+    /// * even for a regular file, stat-then-read is a **TOCTOU** window, since
+    ///   the path can be replaced between the two.
+    ///
+    /// All three are refused on the file TYPE, before anything is opened, and
+    /// the read itself is capped so a file that grows after the check still
+    /// cannot allocate without bound. Refused means reported as `unreadable`,
+    /// not skipped: the operator is told the file is there and unusable.
+    ///
+    /// The FIFO arm runs on a detached `std::thread` with a channel timeout
+    /// rather than through the async handler. Two reasons, both load-bearing:
+    /// `open(O_RDONLY)` on a FIFO blocks in the SYSCALL until a writer appears,
+    /// so awaiting it inside a tokio runtime parks whichever thread is running
+    /// the future — and `Runtime::block_on` runs that future on the CALLING
+    /// thread, which is also the timer driver, so a `timeout` around it could
+    /// never fire and a regression would hang CI rather than fail it. A detached
+    /// thread is not joined at process exit, so leaking one is safe here and the
+    /// assertion becomes a clean failure instead of a stuck job.
+    #[test]
+    fn get_parsers_never_opens_a_non_regular_or_oversized_parser_file() {
+        let dir = scratch_dir("parsers-cap");
+
+        // A FIFO whose length is 0, so a length-only check waves it through.
+        let fifo = dir.join("pipe.json");
+        let made_fifo = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        // A symlink whose own length is the TARGET PATH's length — a few dozen
+        // bytes — pointing at a 2 MiB file. A length-only check reads that small
+        // number, opens the link, and buffers all 2 MiB; the type check never
+        // opens it. This arm discriminates without hanging.
+        let big = dir.join("big-target.txt");
+        std::fs::write(&big, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+        std::os::unix::fs::symlink(&big, dir.join("link.json")).unwrap();
+
+        // A regular file genuinely over the cap.
+        std::fs::write(
+            dir.join("huge.json"),
+            format!(
+                "{{\"pad\":\"{}\"}}",
+                "y".repeat(MAX_PARSER_FILE_BYTES as usize)
+            ),
+        )
+        .unwrap();
+
+        // Symlink: refused on its TYPE, so the 2 MiB target is never read. The
+        // old code read it, failed to parse it, and reported `malformed` — which
+        // reads as "bad content" when the real fault is "not a file".
+        assert_eq!(
+            load_parser_file(&dir.join("link.json"), ParserFormat::Json).err(),
+            Some("unreadable"),
+            "a symlink's own length is its TARGET PATH's, not the target's, so it \
+             must be refused before the target is opened"
+        );
+
+        // Over the cap: not a definition.
+        assert_eq!(
+            load_parser_file(&dir.join("huge.json"), ParserFormat::Json).err(),
+            Some("unreadable"),
+            "a file over the cap must not be parsed"
+        );
+
+        if made_fifo {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let probe = dir.join("pipe.json");
+            std::thread::spawn(move || {
+                let _ = tx.send(load_parser_file(&probe, ParserFormat::Json));
+            });
+            assert_eq!(
+                rx.recv_timeout(std::time::Duration::from_secs(5))
+                    .ok()
+                    .and_then(|r| r.err()),
+                Some("unreadable"),
+                "reading a FIFO blocks until a writer appears, so the handler hung \
+                 on `mkfifo pipe.json`; it must be refused on its file type instead"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

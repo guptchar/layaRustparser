@@ -41,6 +41,85 @@ use ulpf_cli::{scorecard, serve};
 /// free but it is cheap.
 const ONBOARD_MAX_SAMPLES: usize = 25;
 
+/// What `ulpf onboard` got out of a sample file, plus everything the operator
+/// needs to know about how much of it was used.
+struct SampleRead {
+    /// The lines handed to the synthesizer, trimmed, blanks dropped, capped.
+    lines: Vec<String>,
+    /// Lines the operator must be told about. Printed unconditionally, BEFORE
+    /// the minimum-sample gate, so a short read is never reported as merely a
+    /// short file.
+    notices: Vec<String>,
+}
+
+/// Read a sample file for `ulpf onboard`, capped at `ONBOARD_MAX_SAMPLES`.
+///
+/// Streamed and counted, rather than `map_while(Result::ok).take(N)`. That chain
+/// is silent about both things that matter here: a read error part-way through
+/// looks exactly like end-of-file, and a file with 100k lines reports the same
+/// "ingested 25" as one with 25 — so an operator cannot tell that the cap
+/// discarded the evidence their failing sample lived in.
+///
+/// The notices are *returned* rather than printed inline. The reason is
+/// ordering, and it is not cosmetic: the read error is discovered at the point
+/// of failure, which for an undecodable file is the very first line, so the
+/// count is 0 and the caller's minimum-sample gate fires immediately after. Any
+/// printing done at the point of discovery is therefore unreachable exactly when
+/// it matters most. Returning them makes "print every notice, then gate" the
+/// only shape the caller can write.
+///
+/// Takes a `BufRead` rather than a `Path` so the truncation and error arms are
+/// testable from an in-memory reader, including a non-UTF-8 one.
+fn read_samples(reader: impl BufRead, label: &str) -> SampleRead {
+    let mut lines: Vec<String> = Vec::with_capacity(ONBOARD_MAX_SAMPLES);
+    let mut available = 0usize;
+    let mut read_error: Option<String> = None;
+
+    for line in reader.lines() {
+        match line {
+            Ok(l) => {
+                let l = l.trim();
+                if l.is_empty() {
+                    continue;
+                }
+                available += 1;
+                if lines.len() < ONBOARD_MAX_SAMPLES {
+                    lines.push(l.to_string());
+                }
+            }
+            Err(e) => {
+                // Stop, do not skip. A line that failed to decode is a line the
+                // synthesizer never saw, and every downstream pass rate is a
+                // statement about a smaller file than the operator believes
+                // they handed over. Skipping would let the number stand alone.
+                read_error = Some(e.to_string());
+                break;
+            }
+        }
+    }
+
+    let mut notices = Vec::new();
+    if let Some(e) = read_error.as_deref() {
+        notices.push(format!(
+            "  \x1b[1;33m!\x1b[0m reading {label} stopped early: {e}. Any pass rate below covers \
+             only the {} line(s) read so far.",
+            lines.len()
+        ));
+    }
+    if available > lines.len() {
+        notices.push(format!(
+            "  \x1b[1;33m!\x1b[0m {} of {} non-empty lines in {label} were NOT used: the \
+             synthesizer saw only the first {}. A sample that would have shown a failure past \
+             that point was discarded — raise the file's variety, or split it.",
+            available - lines.len(),
+            available,
+            lines.len()
+        ));
+    }
+
+    SampleRead { lines, notices }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "ulpf",
@@ -1217,63 +1296,30 @@ fn run_onboard(args: OnboardArgs) -> Result<()> {
     }
 
     let file = File::open(&args.sample)?;
-    let reader = BufReader::new(file);
-    // Streamed, and counted, rather than `map_while(Result::ok).take(N)`. That
-    // chain is silent about both things that matter here: a read error mid-file
-    // looks exactly like end-of-file, and a file with 100k lines reports the
-    // same "ingested 25" as one with 25 — so an operator cannot tell that the
-    // cap discarded the evidence their failing sample lived in.
-    let mut sample_lines: Vec<String> = Vec::with_capacity(ONBOARD_MAX_SAMPLES);
-    let mut available = 0usize;
-    let mut read_error: Option<String> = None;
-    for line in reader.lines() {
-        match line {
-            Ok(l) => {
-                let l = l.trim();
-                if l.is_empty() {
-                    continue;
-                }
-                available += 1;
-                if sample_lines.len() < ONBOARD_MAX_SAMPLES {
-                    sample_lines.push(l.to_string());
-                }
-            }
-            Err(e) => {
-                read_error = Some(e.to_string());
-                break;
-            }
-        }
+    let samples = read_samples(BufReader::new(file), &args.sample.display().to_string());
+
+    // Every notice is printed BEFORE the minimum-sample check, unconditionally.
+    // That ordering is the whole point: a non-UTF-8 log yields `InvalidData` on
+    // the first `lines()` call, so zero lines are read, the count is 0, and the
+    // check fires — and a bare "found 0" sends the operator to hunt for a file
+    // with too few lines when the real fault is that the onboarder cannot
+    // decode it at all. `read_samples` returning the notices (rather than the
+    // handler printing them inline at the point of discovery) is what makes
+    // that ordering structural instead of a thing to remember.
+    for notice in &samples.notices {
+        println!("{notice}");
     }
 
-    if sample_lines.len() < 3 {
-        println!("\x1b[1;31m[ERROR] Need at least 3 sample log lines to synthesize a parser (found {})\x1b[0m", sample_lines.len());
+    if samples.lines.len() < 3 {
+        println!("\x1b[1;31m[ERROR] Need at least 3 sample log lines to synthesize a parser (found {})\x1b[0m", samples.lines.len());
         std::process::exit(1);
     }
 
     println!(
         "[*] Ingested {} sample raw events for pattern analysis...",
-        sample_lines.len()
+        samples.lines.len()
     );
-    if available > sample_lines.len() {
-        println!(
-            "  \x1b[1;33m!\x1b[0m {} of {} non-empty lines in {} were NOT used: the synthesizer saw \
-             only the first {}. A sample that would have shown a failure past that point was \
-             discarded — raise the file's variety, or split it.",
-            available - sample_lines.len(),
-            available,
-            args.sample.display(),
-            sample_lines.len()
-        );
-    }
-    if let Some(e) = read_error {
-        println!(
-            "  \x1b[1;33m!\x1b[0m reading {} stopped early: {e}. The pass rate below covers only \
-             the {} lines read so far.",
-            args.sample.display(),
-            sample_lines.len()
-        );
-    }
-    let sample_refs: Vec<&str> = sample_lines.iter().map(|s| s.as_str()).collect();
+    let sample_refs: Vec<&str> = samples.lines.iter().map(|s| s.as_str()).collect();
 
     let start = Instant::now();
     let (parser_def, report) = Onboarder::generate_parser(&args.vendor, &args.model, &sample_refs)?;
@@ -1959,6 +2005,135 @@ mod tests {
             .unwrap_or(4);
         assert_eq!(default_parse_workers(), expected);
         assert!(ingest_args_with_capacity(50_000).parse_workers >= 1);
+    }
+
+    /// A read error must survive into the operator's terminal, and must survive
+    /// the case where there are too few lines to onboard from anyway.
+    ///
+    /// The bug this pins: the "stopped early" notice used to be printed *after*
+    /// the `sample_lines.len() < 3` gate, which is unreachable in exactly the
+    /// case that needs it. A non-UTF-8 log fails on the very first `lines()`
+    /// call, so zero lines are read, the gate fires, and the process exits
+    /// having said only:
+    ///
+    ///     [ERROR] Need at least 3 sample log lines (found 0)
+    ///
+    /// That points the operator at the line COUNT, when the actual fault is that
+    /// the onboarder cannot decode the file. They go looking for a short sample
+    /// and find a 40 MB one, and the real cause is never stated. Returning the
+    /// notices from `read_samples` makes the print-before-gate ordering the
+    /// only thing the caller can express, so the case is now structural; the
+    /// assertions below hold it in place.
+    #[test]
+    fn read_samples_reports_a_read_error_even_with_no_usable_lines() {
+        // Bytes that are not UTF-8, with a valid line in front of them: the
+        // reader must stop AT the bad line, not skip it and carry on.
+        let mut raw: Vec<u8> = b"10.0.0.1 10.0.0.2:443 accept\n".to_vec();
+        raw.extend_from_slice(&[0xff, 0xfe, 0x00, 0x01]);
+        raw.extend_from_slice(b"\n10.0.0.3 10.0.0.4:444 accept\n");
+
+        let read = read_samples(std::io::BufReader::new(&raw[..]), "bad.log");
+
+        // The good line before the bad byte IS kept: stopping is not the same
+        // as discarding everything read so far.
+        assert_eq!(read.lines, vec!["10.0.0.1 10.0.0.2:443 accept".to_string()]);
+        assert!(
+            !read
+                .lines
+                .contains(&"10.0.0.3 10.0.0.4:444 accept".to_string()),
+            "reading must STOP at the undecodable line, not skip past it"
+        );
+
+        let joined = read.notices.join("\n");
+        assert!(
+            joined.contains("stopped early"),
+            "the read error must be reported, not swallowed: {joined:?}"
+        );
+        assert!(
+            joined.contains("bad.log"),
+            "the notice must name the file: {joined:?}"
+        );
+        assert!(
+            joined.contains("1 line(s) read so far"),
+            "the notice must scope the pass rate to what was actually read: {joined:?}"
+        );
+
+        // And the gate case: the caller exits on `lines.len() < 3`, so the
+        // notice has to already be in hand. This is the assertion that would
+        // have failed before the reorder.
+        assert!(
+            read.lines.len() < 3 && !read.notices.is_empty(),
+            "a read that cannot onboard must still carry its explanation"
+        );
+
+        // The colour escape must be a real ESC byte, not the four characters
+        // `\x1b`. Rust renders both from the same source spelling, so a doubled
+        // backslash compiles, passes every assertion above, and prints
+        // `\x1b[1;33m!\x1b[0m` as visible garbage in the middle of the warning
+        // it is supposed to be styling. Caught here rather than in review
+        // because it is invisible until someone runs the binary.
+        assert!(
+            !joined.contains("\\x1b") && joined.contains('\u{1b}'),
+            "the notice must carry a real ESC byte, not a literal backslash escape: {joined:?}"
+        );
+    }
+
+    /// The cap is reported, not silently applied.
+    ///
+    /// `map_while(Result::ok).take(N)` and a manual cap look identical from the
+    /// outside — both yield 25 lines — so "ingested 25" is ambiguous between a
+    /// 25-line file and a 100k-line file whose tail held the evidence. The
+    /// operator debugging a failing format needs to know which one they are
+    /// looking at before they trust any pass rate.
+    #[test]
+    fn read_samples_reports_how_many_lines_the_cap_discarded() {
+        let text: String = (0..40)
+            .map(|i| format!("10.0.0.{i} 10.0.0.{}:443 accept\n", i + 100))
+            .collect();
+
+        let read = read_samples(std::io::BufReader::new(text.as_bytes()), "big.log");
+
+        assert_eq!(read.lines.len(), ONBOARD_MAX_SAMPLES);
+        let joined = read.notices.join("\n");
+        assert!(
+            joined.contains("15 of 40 non-empty lines"),
+            "the discarded count must be exact: {joined:?}"
+        );
+        assert!(
+            joined.contains("were NOT used"),
+            "the truncation must be stated in the operator's words: {joined:?}"
+        );
+
+        // Blank lines are not evidence and must not inflate the count: a file of
+        // 40 real lines padded with blanks is still a 40-line file.
+        let padded: String = (0..40)
+            .map(|i| format!("\n\n10.0.0.{i} 10.0.0.{}:443 accept\n", i + 100))
+            .collect();
+        let read = read_samples(std::io::BufReader::new(padded.as_bytes()), "padded.log");
+        assert!(
+            read.notices.join("\n").contains("15 of 40 non-empty lines"),
+            "blanks must not be counted as lines: {:?}",
+            read.notices
+        );
+    }
+
+    /// A clean, in-cap file produces no notices at all.
+    ///
+    /// The other direction: warnings that fire on a healthy read are noise, and
+    /// noise is how a real one gets missed. This is the control for both tests
+    /// above.
+    #[test]
+    fn read_samples_is_quiet_when_nothing_was_lost() {
+        let read = read_samples(
+            std::io::BufReader::new(b"a b c\nd e f\ng h i\n".as_slice()),
+            "ok.log",
+        );
+        assert_eq!(read.lines.len(), 3);
+        assert!(
+            read.notices.is_empty(),
+            "a complete, in-cap read must not warn: {:?}",
+            read.notices
+        );
     }
 
     #[test]

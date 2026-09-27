@@ -31,6 +31,12 @@ pub fn next_publish_tag() -> u64 {
 /// never a truncated one. Temps live beside their targets so the rename
 /// stays on one filesystem (no cross-device hop).
 ///
+/// Each temp is `fsync`ed before its rename and the directory is `fsync`ed
+/// after, so the "never truncated" claim survives a power cut and not just a
+/// process crash. `rename` atomicity alone is a statement about the syscall;
+/// without the flushes the directory entry can outlive the data it points at.
+/// The directory sync is best-effort by necessity — see [`sync_dir`].
+///
 /// On any failure the temp files are removed and any already-renamed target is
 /// rolled back to its prior contents. The three prior states get three
 /// different answers — restore, remove, or leave-alone-and-report — because a
@@ -130,7 +136,7 @@ pub fn publish_parser_pair(
                         "{}.rollback-{tag}",
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ));
-                    if let Err(e) = std::fs::write(&restore_tmp, bytes)
+                    if let Err(e) = write_durable(&restore_tmp, bytes)
                         .and_then(|()| std::fs::rename(&restore_tmp, path))
                     {
                         // Best effort: leaving a stale `*.rollback-tmp-*` behind
@@ -178,8 +184,8 @@ pub fn publish_parser_pair(
         )),
     };
 
-    if let Err(e) =
-        std::fs::write(&json_tmp, json_str).and_then(|()| std::fs::write(&yaml_tmp, yaml_str))
+    if let Err(e) = write_durable(&json_tmp, json_str.as_bytes())
+        .and_then(|()| write_durable(&yaml_tmp, yaml_str.as_bytes()))
     {
         return Err(fail(e, false, false));
     }
@@ -189,7 +195,54 @@ pub fn publish_parser_pair(
     if let Err(e) = std::fs::rename(&yaml_tmp, &yaml_path) {
         return Err(fail(e, true, false));
     }
+
+    // Make the RENAMES durable, not just the bytes. `sync_all` above flushed the
+    // temp files' contents; the directory entry that points at them is a
+    // separate write, and on a crash the entry can be lost while the data
+    // survives (or, worse, the entry survives while the data does not). So the
+    // directory is synced too — otherwise "a crash leaves whole files behind"
+    // is a claim about `rename` semantics and not about the filesystem.
+    sync_dir(dir);
     Ok(())
+}
+
+/// Write `contents` to `path` and flush it to stable storage before returning.
+///
+/// `fs::write` alone only reaches the page cache. That is enough for a
+/// concurrent reader — which is the "never half-written" guarantee — but not
+/// for a power loss, and this is a provenance store: a parser definition that
+/// survives the rename and vanishes on reboot is worse than one that never
+/// published, because nothing reports the difference.
+///
+/// Takes `&[u8]` rather than `&str` so the rollback restore can reuse it: the
+/// prior contents are snapshotted as bytes and must be written back verbatim,
+/// not re-encoded through UTF-8 assumptions.
+fn write_durable(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(contents)?;
+    f.sync_all()
+}
+
+/// Best-effort directory sync. NOT reported as an error, deliberately.
+///
+/// By the time this runs both renames have landed and both temps are consumed,
+/// so there is nothing left to roll back — a failure here means the *content* is
+/// on disk but its directory entry may not survive a power cut. Returning an
+/// `Err` would tell the caller the publish failed while the new definition is
+/// plainly in place, which is a worse lie than a silent best-effort: the caller
+/// would retry, and the retry would overwrite a good file with the same good
+/// file. The window is narrow and the failure mode is a re-publish away.
+///
+/// Silently ignoring an I/O result is normally wrong, so the trade-off is
+/// spelled out here rather than left for a reader to guess at.
+fn sync_dir(dir: &Path) {
+    // `File::open` on a directory then `sync_all` is the portable-enough
+    // fsync-a-directory idiom on unix. On other targets `open` on a directory
+    // may fail outright, which is exactly the "best effort" case.
+    if let Ok(f) = std::fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
 }
 
 #[cfg(test)]
@@ -398,6 +451,80 @@ mod tests {
         drop(listener);
         std::fs::remove_file(&json_path).ok();
         assert_no_tmps(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `write_durable` is byte-exact, including for bytes that are not UTF-8.
+    ///
+    /// It takes `&[u8]` rather than `&str` for exactly this reason: the rollback
+    /// snapshot reads a prior file with `fs::read`, so a prior file that is not
+    /// valid UTF-8 comes back as `Err(InvalidData)`, and a `&str` signature
+    /// would force the restore through a lossy `to_string()` or refuse to
+    /// restore at all. Losing a definition's exact prior bytes during a
+    /// rollback is precisely the "rollback that guesses wrong destroys a
+    /// parser that was working" outcome the tri-state snapshot exists to
+    /// prevent — so the byte path is pinned here, not assumed.
+    ///
+    /// A payload larger than one internal write buffer also exercises the
+    /// short-write path, which is where a hand-rolled `fs::write` replacement
+    /// is most likely to be wrong.
+    #[test]
+    fn write_durable_stores_every_byte_including_non_utf8() {
+        let dir = scratch_dir("durable");
+        let path = dir.join("bytes.bin");
+
+        // Not valid UTF-8, so a `&str` signature could not carry it at all.
+        let mut payload: Vec<u8> = (0..200_000u32).map(|i| (i % 256) as u8).collect();
+        payload[7] = 0xff;
+        payload[8] = 0xfe;
+
+        write_durable(&path, &payload).expect("a durable write must succeed");
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            payload,
+            "every byte must land, in order, with nothing re-encoded or truncated"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            payload.len() as u64,
+            "the on-disk length must be the payload length, not a short write"
+        );
+
+        // Overwriting an existing longer file must TRUNCATE, not leave a tail.
+        // `File::create` truncates; a mode that only seeks would not.
+        write_durable(&path, b"short").unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"short".to_vec(),
+            "a shorter overwrite must not leave the previous tail behind"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `sync_dir` is best-effort by contract, so its failure mode is silence,
+    /// not an error and not a panic.
+    ///
+    /// `publish_parser_pair` calls it after both renames have landed and both
+    /// temps are consumed: there is nothing left to undo, so propagating a
+    /// failure would report a successful publish as a failure and invite a
+    /// pointless retry over a good file. The trade-off is only safe if the
+    /// helper cannot turn a missing or unopenable directory into a panic or a
+    /// caller-visible error, and that is the part worth a test — a `?` here
+    /// would compile fine and break the contract at runtime.
+    #[test]
+    fn sync_dir_is_silent_on_a_directory_it_cannot_open() {
+        let dir = scratch_dir("syncdir");
+        let missing = dir.join("nope-not-created");
+
+        // The happy path must not panic either; on unix it opens and syncs.
+        sync_dir(&dir);
+        // Neither of these may panic, and neither may return anything.
+        sync_dir(&missing);
+        sync_dir(&dir.join("bytes.bin"));
+        sync_dir(std::path::Path::new("/proc/1/nonexistent-xyz"));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
