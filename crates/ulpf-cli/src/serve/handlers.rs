@@ -829,33 +829,56 @@ pub async fn post_onboard(
         )
     })?;
 
-    std::fs::write(&json_path, json_str).map_err(|e| {
+    // Persist the parser definition as a PAIR (JSON for the loader, YAML for
+    // humans). Two separate `write`s are not atomic: if the second fails, the
+    // first is already on disk and the request returns 500 while leaving a
+    // half-published definition that `GET /parsers` will still list. So:
+    // snapshot any pre-existing files, write both, and roll the first one back
+    // if the second fails.
+    let disk_err = |what: &str, e: std::io::Error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: "Disk Write Error".to_string(),
                 code: 500,
-                message: format!("Failed writing parser JSON to disk: {}", e),
+                message: format!("Failed writing parser {what} to disk: {e}"),
                 block_id: None,
                 leaf_index: None,
             }),
         )
-    })?;
+    };
+
+    // Capture prior contents BEFORE touching anything, so a rollback restores
+    // rather than deletes a parser that was already published.
+    let prior_json = std::fs::read(&json_path).ok();
+    let prior_yaml = std::fs::read(&yaml_path).ok();
+
+    std::fs::write(&json_path, json_str).map_err(|e| disk_err("JSON", e))?;
 
     // A silently-dropped YAML write returns 201 claiming the parser hit disk
-    // while data/parsers/*.yaml stays missing — check it like the JSON write.
-    std::fs::write(&yaml_path, yaml_str).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "Disk Write Error".to_string(),
-                code: 500,
-                message: format!("Failed writing parser YAML to disk: {}", e),
-                block_id: None,
-                leaf_index: None,
-            }),
-        )
-    })?;
+    // while data/parsers/*.yaml stays missing — check it like the JSON write,
+    // and undo the JSON half if it does fail.
+    if let Err(e) = std::fs::write(&yaml_path, &yaml_str) {
+        // `write` truncates before writing, so a failure can leave the YAML
+        // half-written: restore its prior contents too, not just the JSON.
+        match &prior_yaml {
+            Some(bytes) => {
+                let _ = std::fs::write(&yaml_path, bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(&yaml_path);
+            }
+        }
+        match prior_json {
+            Some(bytes) => {
+                let _ = std::fs::write(&json_path, bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(&json_path);
+            }
+        }
+        return Err(disk_err("YAML", e));
+    }
 
     // Hot-load into active registry
     {

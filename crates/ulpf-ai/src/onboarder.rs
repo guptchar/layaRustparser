@@ -44,7 +44,7 @@ pub struct ParserDefinition {
     pub confidence_score: f64,
     pub created_at: i64,
     #[serde(skip)]
-    pub regex_cache: Arc<OnceLock<Option<Regex>>>,
+    pub regex_cache: Arc<OnceLock<Result<Regex, regex::Error>>>,
 }
 
 impl Clone for ParserDefinition {
@@ -57,8 +57,14 @@ impl Clone for ParserDefinition {
             sample_logs: self.sample_logs.clone(),
             confidence_score: self.confidence_score,
             created_at: self.created_at,
-            // Arc::clone shares the same OnceLock — clones reuse the compiled regex.
-            regex_cache: Arc::clone(&self.regex_cache),
+            // A FRESH cell, deliberately: `regex_pattern` is public, so a clone
+            // may re-pattern itself. Sharing the cell would leave the clone
+            // silently parsing with the ORIGINAL pattern, disagreeing with the
+            // field that `to_json`/`to_yaml` serialize. The cache is a pure
+            // per-object optimization — sharing it across objects buys nothing
+            // (the registry compiles its own `Regex` at register time) and costs
+            // correctness.
+            regex_cache: Arc::new(OnceLock::new()),
         }
     }
 }
@@ -89,16 +95,19 @@ impl ParserDefinition {
     }
 
     /// Parse an incoming raw log line into normalized OCSF 1.3 NetworkActivity.
-    /// Uses the cached compiled regex (Arc<OnceLock<Option<Regex>>>) — no per-event recompile.
-    /// Returns Err if the pattern fails to compile (never panics).
+    /// Uses the cached compiled regex (Arc<OnceLock<Result<Regex, Error>>>) — no
+    /// per-event recompile. Returns Err if the pattern fails to compile (never
+    /// panics): the compile ERROR is cached too, so a bad definition reports the
+    /// same diagnosable message on every event instead of retrying a hopeless
+    /// compile or panicking a `Result`-returning fn.
     pub fn parse(&self, raw: &str) -> Result<NetworkActivity> {
         let compiled_re = self
             .regex_cache
-            .get_or_init(|| Regex::new(&self.regex_pattern).ok())
+            .get_or_init(|| Regex::new(&self.regex_pattern))
             .as_ref()
-            .ok_or_else(|| {
+            .map_err(|e| {
                 anyhow!(
-                    "Invalid compiled regex in parser definition: {}",
+                    "Invalid compiled regex in parser definition '{}': {e}",
                     self.regex_pattern
                 )
             })?;
@@ -250,7 +259,7 @@ use uuid::Uuid;
 use chrono::Utc;
 
 pub struct __VENDOR____MODEL__Extractor {
-    regex: OnceLock<Option<Regex>>,
+    regex: OnceLock<Result<Regex, regex::Error>>,
 }
 
 impl __VENDOR____MODEL__Extractor {
@@ -259,13 +268,13 @@ impl __VENDOR____MODEL__Extractor {
     }
 
     pub fn parse(&self, raw: &str) -> anyhow::Result<NetworkActivity> {
-        // Cache the compile FAILURE rather than panicking: this is a
-        // Result-returning fn and the pattern may be caller-supplied.
+        // Cache the compile ERROR too, so a bad pattern reports a diagnosable
+        // failure on every event instead of panicking this Result-returning fn.
         let re = self
             .regex
-            .get_or_init(|| Regex::new(r"__PATTERN__").ok())
+            .get_or_init(|| Regex::new(r"__PATTERN__"))
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Invalid regex for __VENDOR__"))?;
+            .map_err(|e| anyhow::anyhow!("Invalid regex for __VENDOR__: {e}"))?;
 
         let caps = re.captures(raw).ok_or_else(|| anyhow::anyhow!("Log match failed"))?;
         let now_ms = Utc::now().timestamp_millis();
@@ -474,12 +483,15 @@ impl Onboarder {
         // gate stays strict (100%): at N=3 a single "allowed" failure is 33%,
         // which is not a 95% rule — it is a rule that reads as one.
         // At/above the floor, a genuine 95% ratio applies (1 failure at N=20).
+        // Zero evaluated samples always fails: an unvalidated parser must never
+        // be admitted, and `0 == 0` would otherwise report a vacuous 0.0% pass.
         const MIN_SAMPLES_FOR_RELAXATION: usize = 20;
-        let passed = if total < MIN_SAMPLES_FOR_RELAXATION {
-            matched == total
-        } else {
-            (matched as f64 / total as f64) >= 0.95
-        };
+        let passed = total > 0
+            && if total < MIN_SAMPLES_FOR_RELAXATION {
+                matched == total
+            } else {
+                (matched as f64 / total as f64) >= 0.95
+            };
 
         Ok(ValidationReport {
             passed,
@@ -610,13 +622,32 @@ impl Onboarder {
     /// Synthesize regex via positional token alignment across sample lines
     fn synthesize_positional_regex(samples: &[&str]) -> Result<String> {
         let re_ip_port = Regex::new(r"^([0-9a-fA-F.:%]+)[:/](\d{1,5})$").unwrap();
-        let re_ip = Regex::new(r"^[0-9a-fA-F.:%]+$").unwrap();
         let re_port = Regex::new(r"^\d{1,5}$").unwrap();
         let re_proto = Regex::new(r"^(?i)(TCP|UDP|ICMP|GRE|ESP|AH|IGMP|SCTP)$").unwrap();
         let re_action =
             Regex::new(r"^(?i)(accept|deny|drop|permit|block|reject|pass|allow)$").unwrap();
         let re_timestamp =
             Regex::new(r"^\d{4}[-/]\d{2}[-/]\d{2}(?:[T\s]\d{2}:\d{2}:\d{2})?$").unwrap();
+
+        // Classification uses REAL address validation, never a character class.
+        // A permissive `[0-9a-fA-F.:%]+` also matches a wall-clock `14:00:01`,
+        // so a timestamp column was captured as `src_ip=14:00` + `src_port=01`
+        // and then rejected by `validate_parser` — three samples, zero parsers.
+        // `parse_ip` is also the only way to tell a bare IPv6 address
+        // (`2001:db8::1`) from the ambiguous `IP:port` form: both are legal IPv6
+        // *and* legal host:port strings, so a complete-valid-IP check must come
+        // first.
+        // `addr:port` shape whose address half really parses, AND which is not
+        // itself a complete address (`2001:db8::1` and `::443` are legal both
+        // ways, so the whole-token check must come first).
+        let is_ip_port = |token: &str| {
+            parse_ip(token).is_none()
+                && re_ip_port
+                    .captures(token)
+                    .and_then(|caps| caps.get(1))
+                    .is_some_and(|ip| parse_ip(ip.as_str()).is_some())
+        };
+        let is_ip = |token: &str| parse_ip(token).is_some();
 
         let split_lines: Vec<Vec<&str>> = samples
             .iter()
@@ -639,12 +670,14 @@ impl Onboarder {
             if all_same {
                 // Static anchor token: escape special regex characters
                 parts.push(regex::escape(col[0]));
-            } else if col
-                .iter()
-                .all(|t| re_ip_port.is_match(t) && t.matches(':').count() < 2)
-            {
-                // IP:Port or IP/Port — but NOT bare IPv6 (2+ colons = IPv6, not IP:port).
-                // Without this guard, `2001:db8::1` matches re_ip_port as src_ip=2001:db8: src_port=1.
+            } else if col.iter().all(|t| re_timestamp.is_match(t)) {
+                // MUST precede the endpoint branches: an `HH:MM:SS` column is
+                // not an address, and the loose class would happily take it.
+                parts.push(r"(?P<timestamp>\S+)".to_string());
+            } else if col.iter().all(|t| is_ip_port(t)) {
+                // Genuine `IP:port` / `IP/port`, where the address half really
+                // parses AND the whole token is not itself a valid address (so
+                // `2001:db8::1` and `::443` stay whole bare IPv6 captures).
                 let delimiter = if col[0].contains(':') { ":" } else { "/" };
                 if ip_count == 0 {
                     parts.push(format!(
@@ -678,7 +711,7 @@ impl Onboarder {
                 } else {
                     parts.push(r"(?:\d{1,5})".to_string());
                 }
-            } else if col.iter().all(|t| re_ip.is_match(t)) {
+            } else if col.iter().all(|t| is_ip(t)) {
                 if ip_count == 0 {
                     parts.push(r"(?P<src_ip>[0-9a-fA-F.:%]+)".to_string());
                     ip_count += 1;
@@ -692,8 +725,6 @@ impl Onboarder {
                 parts.push(r"(?P<protocol>[a-zA-Z0-9]+)".to_string());
             } else if col.iter().all(|t| re_action.is_match(t)) {
                 parts.push(r"(?P<action>[a-zA-Z]+)".to_string());
-            } else if col.iter().all(|t| re_timestamp.is_match(t)) {
-                parts.push(r"(?P<timestamp>\S+)".to_string());
             } else {
                 parts.push(r"(?:\S+)".to_string());
             }
@@ -1031,9 +1062,9 @@ mod tests {
         assert_eq!(report.match_percentage, 100.0);
     }
 
-    /// Compiled regex is cached via Arc<OnceLock<Option<Regex>>> — repeated
-    /// parse() calls must NOT recompile, and a Clone must share the same cell.
-    /// Asserted with Arc::ptr_eq on the cache itself, not just on results.
+    /// Compiled regex is cached via Arc<OnceLock<Result<Regex, Error>>> — repeated
+    /// parse() calls must NOT recompile. Asserted on the cache itself, not just
+    /// on results.
     #[test]
     fn test_parse_caches_compiled_regex() {
         let parser = ParserDefinition {
@@ -1051,28 +1082,40 @@ mod tests {
         let ev2 = parser.parse("src=10.0.0.3 dst=10.0.0.4").unwrap();
         assert_eq!(ev1.src_endpoint.ip.as_deref(), Some("10.0.0.1"));
         assert_eq!(ev2.src_endpoint.ip.as_deref(), Some("10.0.0.3"));
-        assert!(
-            parser.regex_cache.get().is_some(),
-            "cache must be initialized after the first parse"
-        );
-
-        // Clone must SHARE the exact same cache cell (no second compile).
-        let cloned = parser.clone();
-        assert!(
-            Arc::ptr_eq(&parser.regex_cache, &cloned.regex_cache),
-            "Clone must share the compiled-regex cache, not allocate a new one"
-        );
-        // The shared cell is already warm, so this must not recompile.
-        let ev3 = cloned.parse("src=10.0.0.5 dst=10.0.0.6").unwrap();
-        assert_eq!(ev3.src_endpoint.ip.as_deref(), Some("10.0.0.5"));
-
-        // Still exactly one cache cell populated — a recompile would have
-        // produced a second Regex behind the same key.
-        let cached = parser.regex_cache.get().and_then(|r| r.as_ref()).unwrap();
+        let cached = parser
+            .regex_cache
+            .get()
+            .expect("cache must be initialized after the first parse")
+            .as_ref()
+            .expect("cached compile must be Ok for a valid pattern");
         assert!(
             cached.is_match("src=10.0.0.9 dst=10.0.0.8"),
             "the cached Regex must be the live one used by parse()"
         );
+
+        // A Clone gets a FRESH cell, never the warm one: `regex_pattern` is
+        // public, so a clone may re-pattern itself. Sharing would make the
+        // clone parse with the ORIGINAL pattern while to_json/to_yaml serialize
+        // the new one — a silent correctness bug, not a cache hit.
+        let mut cloned = parser.clone();
+        assert!(
+            !Arc::ptr_eq(&parser.regex_cache, &cloned.regex_cache),
+            "Clone must NOT inherit a warm cache cell from the original"
+        );
+        cloned.regex_pattern = r"^src=(?P<src_ip>\S+) only=(?P<dst_ip>\S+)$".to_string();
+        let ev3 = cloned.parse("src=10.0.0.5 only=10.0.0.6").unwrap();
+        assert_eq!(ev3.src_endpoint.ip.as_deref(), Some("10.0.0.5"));
+        assert_eq!(
+            ev3.dst_endpoint.ip.as_deref(),
+            Some("10.0.0.6"),
+            "the clone must use ITS OWN pattern, not the original's"
+        );
+        assert!(
+            cloned.parse("src=10.0.0.5 dst=10.0.0.6").is_err(),
+            "the original pattern must not leak into the re-patterned clone"
+        );
+        // The original is untouched by the clone's divergence.
+        assert!(parser.parse("src=10.0.0.7 dst=10.0.0.8").is_ok());
     }
 
     /// A pattern that fails to compile must return Err, never panic —
@@ -1093,12 +1136,21 @@ mod tests {
         let err = parser
             .parse("src=10.0.0.1")
             .expect_err("invalid regex must Err, not panic");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("Invalid compiled regex"),
-            "error must name the compile failure: {err}"
+            msg.contains("Invalid compiled regex"),
+            "error must name the compile failure: {msg}"
         );
-        // Repeat call must stay Err (cache stores the failure, not panics).
-        assert!(parser.parse("src=10.0.0.1").is_err());
+        // The CACHED error must stay diagnosable: an `Option` cell would have
+        // collapsed this to a bare "no regex" with no cause on every event.
+        assert!(
+            msg.contains("unclosed"),
+            "error must carry the underlying regex::Error cause: {msg}"
+        );
+        // Repeat call must stay Err with the same cause (cache stores the
+        // failure, not panics).
+        let err2 = parser.parse("src=10.0.0.1").expect_err("still Err");
+        assert_eq!(err2.to_string(), msg, "cached failure must be stable");
     }
 
     /// A deserialized definition with a bad pattern (the real trust boundary)
@@ -1360,6 +1412,66 @@ mod tests {
             "standalone port column must be captured, not swallowed by the IP branch"
         );
         assert_eq!(caps.name("dst_port").map(|m| m.as_str()), Some("22"));
+    }
+
+    /// Zero evaluated samples must FAIL. `0 == 0` reported a vacuous pass with a
+    /// 0.0% match rate — the worst possible outcome for a validation gate.
+    #[test]
+    fn test_threshold_fails_with_zero_samples() {
+        let parser = ParserDefinition {
+            vendor: "test".into(),
+            device_model: "empty".into(),
+            regex_pattern: r"^srcip=(?P<src_ip>\S+) dstip=(?P<dst_ip>\S+)$".to_string(),
+            action_mappings: HashMap::new(),
+            sample_logs: vec![],
+            confidence_score: 1.0,
+            created_at: 0,
+            regex_cache: Arc::new(OnceLock::new()),
+        };
+        for empty in [vec![], vec!["", "   ", "\t"]] {
+            let report = Onboarder::validate_parser(&parser, &empty).unwrap();
+            assert_eq!(report.total_samples, 0);
+            assert!(
+                !report.passed,
+                "a parser validated against {empty:?} must not be admitted"
+            );
+        }
+    }
+
+    /// A wall-clock column is not an address. The permissive `[0-9a-fA-F.:%]+`
+    /// class also matches `14:00:01`, so a positional log with an HH:MM:SS
+    /// column was synthesized as `src_ip=14:00` + `src_port=01` and then failed
+    /// its own validation.
+    #[test]
+    fn test_positional_synthesizer_wall_clock_column_is_not_an_endpoint() {
+        let samples = vec![
+            "2026-09-21 14:00:01 10.0.0.1 10.0.0.2 443 TCP accept",
+            "2026-09-21 14:00:02 10.0.0.3 10.0.0.4 444 TCP accept",
+            "2026-09-21 14:00:03 10.0.0.5 10.0.0.6 445 TCP accept",
+        ];
+        let pattern = Onboarder::synthesize_regex(&samples).unwrap();
+        let re = Regex::new(&pattern).unwrap();
+        let caps = re.captures(samples[0]).unwrap();
+        assert_eq!(caps.name("src_ip").map(|m| m.as_str()), Some("10.0.0.1"));
+        assert_eq!(caps.name("dst_ip").map(|m| m.as_str()), Some("10.0.0.2"));
+        assert_eq!(caps.name("src_port").map(|m| m.as_str()), Some("443"));
+        // The synthesized pattern must pass its own validator — the whole point.
+        let parser = ParserDefinition {
+            vendor: "v".into(),
+            device_model: "m".into(),
+            regex_pattern: pattern,
+            action_mappings: HashMap::new(),
+            sample_logs: vec![],
+            confidence_score: 1.0,
+            created_at: 0,
+            regex_cache: Arc::new(OnceLock::new()),
+        };
+        let report = Onboarder::validate_parser(&parser, &samples).unwrap();
+        assert!(
+            report.passed,
+            "a synthesized pattern must survive its own validation: {:?}",
+            report.errors
+        );
     }
 
     /// Registry is bounded (REGISTRY_CAPACITY) with LRU-by-last-use eviction and
