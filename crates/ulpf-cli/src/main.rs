@@ -21,6 +21,14 @@ use ulpf_ai::pipeline::TieredPipeline;
 use ulpf_core::ingest::socket::{create_tcp_listener, create_udp_socket};
 use ulpf_core::ingest::{BackpressurePolicy, LogQueue, MemoryQueue};
 
+use ulpf_core::parser::UniversalParser;
+use ulpf_core::schema::ocsf::NetworkActivity;
+use ulpf_integrity::batcher::{BatchAccumulator, BatcherConfig, IncomingLog};
+use ulpf_integrity::storage::ParquetCompression;
+use ulpf_integrity::tamper::verify_block_with_ledger;
+
+use ulpf_cli::{scorecard, serve};
+
 /// Upper bound on sample lines read by `ulpf onboard`.
 ///
 /// Deliberately above 20. The validator's threshold is
@@ -32,13 +40,6 @@ use ulpf_core::ingest::{BackpressurePolicy, LogQueue, MemoryQueue};
 /// (more evidence that a column really is static), so the extra headroom is not
 /// free but it is cheap.
 const ONBOARD_MAX_SAMPLES: usize = 25;
-use ulpf_core::parser::UniversalParser;
-use ulpf_core::schema::ocsf::NetworkActivity;
-use ulpf_integrity::batcher::{BatchAccumulator, BatcherConfig, IncomingLog};
-use ulpf_integrity::storage::ParquetCompression;
-use ulpf_integrity::tamper::verify_block_with_ledger;
-
-use ulpf_cli::{scorecard, serve};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -1042,13 +1043,32 @@ fn run_onboard(args: OnboardArgs) -> Result<()> {
 
     let file = File::open(&args.sample)?;
     let reader = BufReader::new(file);
-    let sample_lines: Vec<String> = reader
-        .lines()
-        .map_while(Result::ok)
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .take(ONBOARD_MAX_SAMPLES)
-        .collect();
+    // Streamed, and counted, rather than `map_while(Result::ok).take(N)`. That
+    // chain is silent about both things that matter here: a read error mid-file
+    // looks exactly like end-of-file, and a file with 100k lines reports the
+    // same "ingested 25" as one with 25 — so an operator cannot tell that the
+    // cap discarded the evidence their failing sample lived in.
+    let mut sample_lines: Vec<String> = Vec::with_capacity(ONBOARD_MAX_SAMPLES);
+    let mut available = 0usize;
+    let mut read_error: Option<String> = None;
+    for line in reader.lines() {
+        match line {
+            Ok(l) => {
+                let l = l.trim();
+                if l.is_empty() {
+                    continue;
+                }
+                available += 1;
+                if sample_lines.len() < ONBOARD_MAX_SAMPLES {
+                    sample_lines.push(l.to_string());
+                }
+            }
+            Err(e) => {
+                read_error = Some(e.to_string());
+                break;
+            }
+        }
+    }
 
     if sample_lines.len() < 3 {
         println!("\x1b[1;31m[ERROR] Need at least 3 sample log lines to synthesize a parser (found {})\x1b[0m", sample_lines.len());
@@ -1059,6 +1079,25 @@ fn run_onboard(args: OnboardArgs) -> Result<()> {
         "[*] Ingested {} sample raw events for pattern analysis...",
         sample_lines.len()
     );
+    if available > sample_lines.len() {
+        println!(
+            "  \x1b[1;33m!\x1b[0m {} of {} non-empty lines in {} were NOT used: the synthesizer saw \
+             only the first {}. A sample that would have shown a failure past that point was \
+             discarded — raise the file's variety, or split it.",
+            available - sample_lines.len(),
+            available,
+            args.sample.display(),
+            sample_lines.len()
+        );
+    }
+    if let Some(e) = read_error {
+        println!(
+            "  \x1b[1;33m!\x1b[0m reading {} stopped early: {e}. The pass rate below covers only \
+             the {} lines read so far.",
+            args.sample.display(),
+            sample_lines.len()
+        );
+    }
     let sample_refs: Vec<&str> = sample_lines.iter().map(|s| s.as_str()).collect();
 
     let start = Instant::now();
@@ -1087,15 +1126,23 @@ fn run_onboard(args: OnboardArgs) -> Result<()> {
     );
 
     fs::create_dir_all(&args.out)?;
-    let json_path = args
-        .out
-        .join(format!("{}.json", args.vendor.to_lowercase()));
-    let yaml_path = args
-        .out
-        .join(format!("{}.yaml", args.vendor.to_lowercase()));
+    let json_file = format!("{}.json", args.vendor.to_lowercase());
+    let yaml_file = format!("{}.yaml", args.vendor.to_lowercase());
+    let json_path = args.out.join(&json_file);
+    let yaml_path = args.out.join(&yaml_file);
 
-    fs::write(&json_path, parser_def.to_json()?)?;
-    fs::write(&yaml_path, parser_def.to_yaml()?)?;
+    // The SAME atomic pair-publish the serve plane uses. Writing the two files
+    // with independent `fs::write` calls leaves a window — a crash, a full
+    // disk, a concurrent reader — in which one half of the definition is new
+    // and the other is stale or truncated, and the loader takes whichever half
+    // it reads first. One implementation, one guarantee, two callers.
+    ulpf_cli::persist::publish_parser_pair(
+        &args.out,
+        &json_file,
+        &yaml_file,
+        &parser_def.to_json()?,
+        &parser_def.to_yaml()?,
+    )?;
 
     println!("[+] Parser specification exported successfully:");
     println!("    JSON : {}", json_path.display());

@@ -16,6 +16,7 @@ use tar::Builder;
 use uuid::Uuid;
 
 use super::state::{AlertItem, AppState, MetricsResponse};
+use crate::persist::publish_parser_pair;
 use ulpf_ai::drain::AlertSeverity;
 use ulpf_ai::onboarder::{Onboarder, ParserDefinition, ValidationReport};
 use ulpf_core::parser::UniversalParser;
@@ -114,6 +115,14 @@ pub struct ParserItem {
     pub device_model: String,
     pub parser_type: String,
     pub status: String,
+    /// The file this row was read from, when it came from disk.
+    ///
+    /// Present because `vendor` is a SENTINEL for a file that would not
+    /// deserialize: it is genuinely unknown, not empty, and `<malformed>` must
+    /// not be mistaken for a vendor a UI can filter on. That makes the row
+    /// unactionable on its own, so the path travels with it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub regex_pattern: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -532,11 +541,135 @@ pub async fn get_prove_inclusion(
     }))
 }
 
+/// Upper bound on a parser-definition file read by `GET /parsers`.
+///
+/// A definition this system can produce is a few kB. This endpoint is
+/// unauthenticated on loopback and re-reads every file on every request, so an
+/// unbounded read turns one stray multi-GB file in `data/parsers/` into an OOM
+/// on a request whose whole job is to report status. Over the cap is reported
+/// `unreadable`, which is the honest answer: this is not a definition.
+const MAX_PARSER_FILE_BYTES: u64 = 1 << 20;
+
+/// Which on-disk deserializer a parser file needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParserFormat {
+    Json,
+    Yaml,
+}
+
+/// Read one parser file.
+///
+/// The `Err` value IS the status to report, which keeps the two failure shapes
+/// distinguishable — an operator's fix is completely different for each:
+///
+/// * `"unreadable"` — the entry exists but its bytes never arrived (I/O error,
+///   oversized, not a regular file). Nothing was learned about the contents.
+/// * `"malformed"` — the bytes arrived and are not a `ParserDefinition`.
+///
+/// Note that `is_file()` is deliberately NOT a pre-filter. It silently drops
+/// exactly the entries worth reporting: a directory or a socket named
+/// `*.json` is not a parser, and that is a finding, not a non-event.
+fn load_parser_file(
+    path: &std::path::Path,
+    format: ParserFormat,
+) -> Result<ParserDefinition, &'static str> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.len() > MAX_PARSER_FILE_BYTES => return Err("unreadable"),
+        Ok(_) => {}
+        Err(_) => return Err("unreadable"),
+    }
+    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+        // It IS a parser file; its bytes just are not a parser.
+        std::io::ErrorKind::InvalidData => "malformed",
+        _ => "unreadable",
+    })?;
+    match format {
+        ParserFormat::Json => ParserDefinition::from_json(&content),
+        ParserFormat::Yaml => ParserDefinition::from_yaml(&content),
+    }
+    .map_err(|_| "malformed")
+}
+
+/// Build the listing row for one vendor slug from whichever halves exist.
+///
+/// `halves` must be ordered by preference (JSON, then `.yaml`, then `.yml`);
+/// the caller sorts for that. The row describes the BEST half that loads. The
+/// loader (`AppState::new`) accepts either half of a pair, so a broken JSON
+/// whose YAML twin is healthy is a parser that is genuinely serving; reporting
+/// it `malformed` would be a false alarm about working software. A status
+/// endpoint has to say what the loader will do, not what one file contains.
+fn parser_item_for(slug: &str, halves: &[(ParserFormat, std::path::PathBuf)]) -> ParserItem {
+    let mut loaded = None;
+    let mut first_failure: Option<(&'static str, String)> = None;
+    for (format, path) in halves {
+        let path_label = path.display().to_string();
+        match load_parser_file(path, *format) {
+            Ok(def) => {
+                loaded = Some((def, path_label));
+                break;
+            }
+            // Keep the FIRST failure, not the last: the caller wants one
+            // actionable reason, and a merge of two would be neither.
+            Err(status) => {
+                first_failure.get_or_insert((status, path_label));
+            }
+        }
+    }
+
+    match loaded {
+        Some((def, source_path)) => {
+            // A definition that deserialized but whose pattern will not compile
+            // can never match an event, so it is reported `invalid` — not
+            // `active`. This is the whole reason the listing exists: the file
+            // being present and the parser being usable are different facts.
+            let status = if Regex::new(&def.regex_pattern).is_ok() {
+                "active"
+            } else {
+                "invalid"
+            };
+            ParserItem {
+                vendor: def.vendor,
+                device_model: def.device_model,
+                parser_type: "dynamic_onboarded".to_string(),
+                status: status.to_string(),
+                source_path: Some(source_path),
+                regex_pattern: Some(def.regex_pattern),
+                confidence_score: Some(def.confidence_score),
+                created_at: Some(def.created_at),
+            }
+        }
+        None => {
+            let (status, source_path) =
+                first_failure.unwrap_or(("unreadable", format!("{slug} (no readable file)")));
+            let sentinel = format!("<{status}>");
+            ParserItem {
+                vendor: sentinel.clone(),
+                device_model: sentinel,
+                parser_type: "dynamic_onboarded".to_string(),
+                status: status.to_string(),
+                source_path: Some(source_path),
+                regex_pattern: None,
+                confidence_score: None,
+                created_at: None,
+            }
+        }
+    }
+}
+
 /// GET /parsers
+///
+/// Reports every parser the loader knows about, INCLUDING the ones that cannot
+/// work. A file that exists but is unusable used to be either skipped entirely
+/// — so it simply vanished, indistinguishable from never having been onboarded
+/// — or listed `active` even when its pattern could never compile. An operator
+/// reading this endpoint has no other way to tell a working parser from a dead
+/// one, which is the only reason this endpoint is worth having.
 pub async fn get_parsers(State(state): State<AppState>) -> Json<Vec<ParserItem>> {
     let mut items = Vec::new();
 
-    // 1. Built-in native zero-copy extractors
+    // 1. Built-in native zero-copy extractors. `active` is a statement about
+    // the running binary, not about a file: these are compiled in, so there is
+    // nothing on disk that could contradict it.
     let native_vendors = [
         ("cisco_asa", "ASA 5500-X / Firepower"),
         ("fortigate", "FortiGate NGFW (v7.0+)"),
@@ -552,70 +685,49 @@ pub async fn get_parsers(State(state): State<AppState>) -> Json<Vec<ParserItem>>
             device_model: model.to_string(),
             parser_type: "native_extractor".to_string(),
             status: "active".to_string(),
+            source_path: None,
             regex_pattern: None,
             confidence_score: Some(1.0),
             created_at: None,
         });
     }
 
-    // 2. Dynamic onboarded parsers from data/parsers/
-    if state.parsers_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&state.parsers_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if !p.is_file() {
-                    continue;
-                }
-                if p.extension().and_then(|s| s.to_str()) != Some("json") {
-                    continue;
-                }
-                // A file that exists but cannot be used is REPORTED, not
-                // skipped. Both failure modes were previously invisible here:
-                // an unparseable file simply vanished from the listing, and a
-                // file whose `regex_pattern` does not compile was listed as
-                // `active` even though it can never match an event. An operator
-                // reading this endpoint has no other way to tell a working
-                // parser from a dead one.
-                let item = match std::fs::read_to_string(&p) {
-                    Err(_) => ParserItem {
-                        vendor: "<unreadable>".to_string(),
-                        device_model: p.display().to_string(),
-                        parser_type: "dynamic_onboarded".to_string(),
-                        status: "unreadable".to_string(),
-                        regex_pattern: None,
-                        confidence_score: None,
-                        created_at: None,
-                    },
-                    Ok(content) => match ParserDefinition::from_json(&content) {
-                        Err(_) => ParserItem {
-                            vendor: "<malformed>".to_string(),
-                            device_model: p.display().to_string(),
-                            parser_type: "dynamic_onboarded".to_string(),
-                            status: "malformed".to_string(),
-                            regex_pattern: None,
-                            confidence_score: None,
-                            created_at: None,
-                        },
-                        Ok(def) => {
-                            let status = if Regex::new(&def.regex_pattern).is_ok() {
-                                "active"
-                            } else {
-                                "invalid"
-                            };
-                            ParserItem {
-                                vendor: def.vendor,
-                                device_model: def.device_model,
-                                parser_type: "dynamic_onboarded".to_string(),
-                                status: status.to_string(),
-                                regex_pattern: Some(def.regex_pattern),
-                                confidence_score: Some(def.confidence_score),
-                                created_at: Some(def.created_at),
-                            }
-                        }
-                    },
-                };
-                items.push(item);
-            }
+    // 2. Dynamic onboarded parsers from data/parsers/, GROUPED BY SLUG.
+    //
+    // The grouping is the point. The loader takes `*.json` via `load_from_json`
+    // AND `*.yaml`/`*.yml` via `load_from_yaml`, so both halves of a pair are
+    // live. Reading only the JSON half — as this endpoint used to — hid a
+    // YAML-only parser entirely and flagged a healthy parser `malformed`
+    // because its JSON twin was corrupt.
+    if let Ok(entries) = std::fs::read_dir(&state.parsers_dir) {
+        let mut by_slug: std::collections::BTreeMap<
+            String,
+            Vec<(ParserFormat, std::path::PathBuf)>,
+        > = std::collections::BTreeMap::new();
+        for entry in entries.flatten() {
+            let p = entry.path();
+            // Classify BEFORE inserting. A slot created for a file this loop
+            // then ignores would surface as a row with no file behind it.
+            let format = match p.extension().and_then(|s| s.to_str()) {
+                Some("json") => ParserFormat::Json,
+                Some("yaml") | Some("yml") => ParserFormat::Yaml,
+                _ => continue,
+            };
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            by_slug
+                .entry(stem.to_string())
+                .or_default()
+                .push((format, p));
+        }
+        for (slug, mut halves) in by_slug {
+            // Sorted so a `foo.json` + `foo.yaml` + `foo.yml` directory always
+            // resolves the same way. `read_dir` order is not guaranteed, and
+            // the first half that loads wins the row, so an unsorted scan
+            // would make the reported status depend on the filesystem.
+            halves.sort_by(|a, b| a.1.cmp(&b.1));
+            items.push(parser_item_for(&slug, &halves));
         }
     }
 
@@ -754,161 +866,6 @@ pub async fn post_parsers_test(
     }))
 }
 
-/// Temp-file disambiguator so concurrent onboard requests never share a name.
-static PUBLISH_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Atomically publish the JSON+YAML parser pair.
-///
-/// Both payloads are written to temp files in the SAME directory, then
-/// `rename`d over their targets. `rename(2)` is atomic on POSIX: readers
-/// (e.g. `GET /parsers`) never observe a half-written definition, and a
-/// crash between the two renames leaves at worst one stale-but-whole file —
-/// never a truncated one. Temps live beside their targets so the rename
-/// stays on one filesystem (no cross-device hop).
-///
-/// On any failure the temp files are removed and any already-renamed target
-/// is rolled back to its prior contents (or removed if it did not exist),
-/// so there is no window where only one half of the pair exists.
-///
-/// A rollback that itself fails is NOT swallowed: the returned error names
-/// both the original publish failure and whatever could not be undone, because
-/// silently reporting only the first would leave a caller believing the
-/// directory is clean when it is not.
-fn publish_parser_pair(
-    dir: &std::path::Path,
-    json_file: &str,
-    yaml_file: &str,
-    json_str: &str,
-    yaml_str: &str,
-) -> std::io::Result<()> {
-    let json_path = dir.join(json_file);
-    let yaml_path = dir.join(yaml_file);
-
-    // Snapshot BEFORE touching anything, so a rollback restores rather than
-    // deletes a parser that was already published.
-    //
-    // Tri-state, deliberately. `read(..).ok()` collapses "no file there" and
-    // "the file is there but unreadable" into the same `None`, and the rollback
-    // below deletes on `None` — so an unreadable existing parser (bad
-    // permissions, transient I/O error) would have been DELETED on failure
-    // rather than restored. The three cases need three answers.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Prior {
-        /// Existed; these are its bytes.
-        Present,
-        /// Did not exist, so a rollback should remove whatever landed.
-        Absent,
-        /// Existed but could not be read. Contents unknown — a rollback must
-        /// not guess, and must not delete.
-        Unreadable,
-    }
-    let snapshot = |path: &std::path::Path| -> (Option<Vec<u8>>, Prior) {
-        match std::fs::read(path) {
-            Ok(bytes) => (Some(bytes), Prior::Present),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, Prior::Absent),
-            Err(_) => (None, Prior::Unreadable),
-        }
-    };
-    let (prior_json, state_json) = snapshot(&json_path);
-    let (prior_yaml, state_yaml) = snapshot(&yaml_path);
-
-    let tag = format!(
-        "tmp-{}-{}",
-        std::process::id(),
-        PUBLISH_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
-    let json_tmp = dir.join(format!("{json_file}.{tag}"));
-    let yaml_tmp = dir.join(format!("{yaml_file}.{tag}"));
-
-    // Clean up the temps, then undo any rename that already happened. Targets
-    // that were never renamed are untouched — the originals are still whole on
-    // disk. Restores go through their own temp + rename for the same reason the
-    // publish does: a plain `write` to the target truncates it first, so a
-    // failed restore would leave the previous definition destroyed rather than
-    // merely unreverted.
-    let rollback = |json_renamed: bool, yaml_renamed: bool| -> std::io::Result<()> {
-        let mut problems: Vec<String> = Vec::new();
-        // A temp that is already gone is the EXPECTED case, not a problem: the
-        // half that renamed successfully no longer has one. Reporting it would
-        // make every clean rollback claim to be incomplete.
-        let mut drop_temp = |r: std::io::Result<()>, what: &str| match r {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => problems.push(format!("{what}: {e}")),
-            Ok(()) => {}
-        };
-
-        drop_temp(std::fs::remove_file(&json_tmp), "temp json");
-        drop_temp(std::fs::remove_file(&yaml_tmp), "temp yaml");
-        for (path, prior, prior_state, renamed, what) in [
-            (&json_path, &prior_json, state_json, json_renamed, "json"),
-            (&yaml_path, &prior_yaml, state_yaml, yaml_renamed, "yaml"),
-        ] {
-            if !renamed {
-                continue;
-            }
-            match prior_state {
-                Prior::Present => {
-                    let bytes = prior.as_ref().expect("Present implies Some");
-                    let restore_tmp = dir.join(format!(
-                        "{}.rollback-{tag}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
-                    if let Err(e) = std::fs::write(&restore_tmp, bytes)
-                        .and_then(|()| std::fs::rename(&restore_tmp, path))
-                    {
-                        problems.push(format!("{what}: {e}"));
-                    }
-                }
-                Prior::Absent => {
-                    if let Err(e) = std::fs::remove_file(path) {
-                        problems.push(format!("{what}: {e}"));
-                    }
-                }
-                Prior::Unreadable => {
-                    // The prior contents are unknown, so neither restoring nor
-                    // deleting is defensible. Leave the new content in place —
-                    // the file is at least valid — and say the rollback is
-                    // incomplete so the operator knows to reconcile it.
-                    problems.push(format!(
-                        "{what}: could not read the prior file before publishing, so it was \
-                         not restored; it now holds the new definition"
-                    ));
-                }
-            }
-        }
-        if problems.is_empty() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(problems.join("; ")))
-        }
-    };
-
-    // Stage BOTH payloads before either becomes visible: a failure here
-    // leaves the originals untouched.
-    let fail = |e: std::io::Error, json_renamed: bool, yaml_renamed: bool| match rollback(
-        json_renamed,
-        yaml_renamed,
-    ) {
-        Ok(()) => e,
-        Err(rollback_err) => std::io::Error::other(format!(
-            "publish failed: {e}; and the rollback was incomplete: {rollback_err}"
-        )),
-    };
-
-    if let Err(e) =
-        std::fs::write(&json_tmp, json_str).and_then(|()| std::fs::write(&yaml_tmp, yaml_str))
-    {
-        return Err(fail(e, false, false));
-    }
-    if let Err(e) = std::fs::rename(&json_tmp, &json_path) {
-        return Err(fail(e, false, false));
-    }
-    if let Err(e) = std::fs::rename(&yaml_tmp, &yaml_path) {
-        return Err(fail(e, true, false));
-    }
-    Ok(())
-}
-
 /// POST /onboard
 /// 1-Click air-gapped onboarding wizard.
 /// If `confirm: false`, returns synthesis preview without writing to disk.
@@ -1044,10 +1001,12 @@ pub async fn post_onboard(
     })?;
 
     // Persist the parser definition as a PAIR (JSON for the loader, YAML for
-    // humans) — atomically. `publish_parser_pair` tmp-writes both payloads
-    // then renames them over the targets, so readers never see a
-    // half-published definition and a crash mid-write leaves whole files
-    // behind, never truncated ones.
+    // humans) — atomically, via the same `persist::publish_parser_pair` the
+    // `ulpf onboard` CLI uses. It tmp-writes both payloads then renames them
+    // over the targets, so readers never see a half-published definition and a
+    // crash mid-write leaves whole files behind, never truncated ones. A
+    // failure rolls the pair back to its prior state, or says which half could
+    // not be restored rather than leaving the caller to guess.
     let disk_err = |what: &str, e: std::io::Error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1543,211 +1502,178 @@ mod tests {
             "expected good + broken + malformed, got {dynamic:?}"
         );
 
+        // A sentinel vendor is unactionable on its own, so the row must carry
+        // the file it came from.
+        let bad = by_status("malformed");
+        assert_eq!(
+            bad.source_path.as_deref(),
+            Some(dir.join("malformed.json").to_str().unwrap()),
+            "a file-level failure must name the file: {bad:?}"
+        );
+        // Native extractors have no file, and must not pretend to.
+        let native = items.iter().find(|i| i.parser_type == "native_extractor");
+        assert_eq!(native.and_then(|i| i.source_path.as_ref()), None);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Fresh temp dir per test (pid-tagged): publish tests must not share
-    /// state, and must not touch the repo's real `data/parsers`.
+    /// The listing must describe what the LOADER will do, not what one file
+    /// contains.
+    ///
+    /// `AppState::new` loads `*.json` via `load_from_json` AND `*.yaml`/`*.yml`
+    /// via `load_from_yaml`, so both halves of a pair are live. The listing used
+    /// to read only the JSON half, which produced two distinct lies: a
+    /// YAML-only parser was absent from the listing entirely, and a corrupt JSON
+    /// whose YAML twin was healthy was reported `malformed` — a false alarm
+    /// about a parser that is serving traffic right now.
+    #[tokio::test]
+    async fn get_parsers_reports_the_half_the_loader_would_actually_use() {
+        let dir = scratch_dir("parsers-pair");
+
+        let good = ParserDefinition {
+            vendor: "pairco".into(),
+            device_model: "ok".into(),
+            regex_pattern: r"^src=(?P<src_ip>[0-9.]+)$".to_string(),
+            action_mappings: HashMap::new(),
+            sample_logs: vec![],
+            confidence_score: 1.0,
+            created_at: 0,
+            regex_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
+        };
+
+        // (1) YAML only: the loader serves it, so the listing must show it.
+        std::fs::write(dir.join("yamlonly.yaml"), good.to_yaml().unwrap()).unwrap();
+
+        // (2) Corrupt JSON, healthy YAML twin: the loader falls through to the
+        // YAML, so this parser is alive and must not be called malformed.
+        std::fs::write(dir.join("halfbroke.json"), b"{ not json").unwrap();
+        std::fs::write(dir.join("halfbroke.yaml"), good.to_yaml().unwrap()).unwrap();
+
+        // (3) Both halves broken: only now is a failure status correct.
+        std::fs::write(dir.join("bothbroke.json"), b"{ not json").unwrap();
+        std::fs::write(dir.join("bothbroke.yaml"), b"also: not: a: parser").unwrap();
+
+        let items = get_parsers(State(AppState::new(
+            dir.clone(),
+            dir.join("ledger.jsonl"),
+            dir.clone(),
+            dir.join("eval.md"),
+        )))
+        .await
+        .0;
+        let row = |slug: &str| {
+            items
+                .iter()
+                .find(|i| {
+                    i.parser_type == "dynamic_onboarded"
+                        && i.source_path.as_deref().is_some_and(|p| p.contains(slug))
+                })
+                .unwrap_or_else(|| panic!("no dynamic row for {slug} in {items:?}"))
+        };
+
+        let y = row("yamlonly");
+        assert_eq!(y.vendor, "pairco");
+        assert_eq!(y.status, "active", "a YAML-only parser IS served: {y:?}");
+
+        let h = row("halfbroke");
+        assert_eq!(
+            h.status, "active",
+            "the loader falls through to the healthy YAML twin, so this is a false \
+             alarm if reported broken: {h:?}"
+        );
+        assert_eq!(
+            h.source_path.as_deref(),
+            Some(dir.join("halfbroke.yaml").to_str().unwrap()),
+            "the reported file must be the one that loaded: {h:?}"
+        );
+
+        let b = row("bothbroke");
+        assert_eq!(
+            b.status, "malformed",
+            "with no healthy half, the failure must surface: {b:?}"
+        );
+        // JSON is preferred, so its reason is the one reported.
+        assert_eq!(
+            b.source_path.as_deref(),
+            Some(dir.join("bothbroke.json").to_str().unwrap()),
+            "{b:?}"
+        );
+
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i.parser_type == "dynamic_onboarded")
+                .count(),
+            3,
+            "one row per SLUG, not per file: {items:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `unreadable` and `malformed` are different problems with different
+    /// fixes, and both must be reachable.
+    ///
+    /// The old scan used `is_file()` as a pre-filter, which silently dropped
+    /// exactly the entries worth reporting — so `unreadable` could not fire
+    /// for a directory or a socket. And a single `.ok()` on the read collapsed
+    /// "bad permissions" into "not a parser", so an operator with an I/O fault
+    /// was told to go fix their JSON syntax.
+    #[tokio::test]
+    async fn get_parsers_distinguishes_unreadable_entries_from_malformed_content() {
+        let dir = scratch_dir("parsers-unreadable");
+
+        // Exists, is a parser-shaped name, but its bytes never arrive: a
+        // directory. `is_file()` used to drop it into invisibility.
+        std::fs::create_dir(dir.join("adir.json")).unwrap();
+
+        // Bytes arrive but are not UTF-8, so this IS a parser file whose content
+        // is wrong — a different fix than an I/O fault.
+        std::fs::write(dir.join("binary.json"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+        let items = get_parsers(State(AppState::new(
+            dir.clone(),
+            dir.join("ledger.jsonl"),
+            dir.clone(),
+            dir.join("eval.md"),
+        )))
+        .await
+        .0;
+        let row = |slug: &str| {
+            items
+                .iter()
+                .find(|i| {
+                    i.parser_type == "dynamic_onboarded"
+                        && i.source_path.as_deref().is_some_and(|p| p.contains(slug))
+                })
+                .unwrap_or_else(|| panic!("no dynamic row for {slug} in {items:?}"))
+        };
+
+        let d = row("adir.json");
+        assert_eq!(
+            d.status, "unreadable",
+            "a non-regular file must be reported, not skipped: {d:?}"
+        );
+
+        let b = row("binary.json");
+        assert_eq!(
+            b.status, "malformed",
+            "non-UTF-8 bytes are bad content, not an I/O fault: {b:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Fresh temp dir per test (pid-tagged): tests must not share state, and
+    /// must not touch the repo's real `data/parsers`.
     fn scratch_dir(case: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "ulpf-publish-test-{}-{}-{}",
+            "ulpf-serve-test-{}-{}-{}",
             case,
             std::process::id(),
-            PUBLISH_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            crate::persist::next_publish_tag()
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
         dir
-    }
-
-    /// No temp file may survive a publish. A leftover `*.tmp-*` is a staged
-    /// definition that was never published, and a `*.rollback-tmp-*` is a
-    /// staged restore that never landed — both are debris, so the check covers
-    /// both name shapes. `publish_parser_pair` never scans the directory, so
-    /// this is purely an assertion that the cleanup paths ran.
-    fn assert_no_tmps(dir: &std::path::Path) {
-        let leftovers: Vec<_> = std::fs::read_dir(dir)
-            .expect("scratch dir must be listable")
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.contains("tmp-"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "temp files left behind after publish: {leftovers:?}"
-        );
-    }
-
-    #[test]
-    fn test_publish_pair_writes_both_then_renames() {
-        let dir = scratch_dir("happy");
-        publish_parser_pair(&dir, "fw.json", "fw.yaml", r#"{"a":1}"#, "a: 1\n")
-            .expect("fresh publish must succeed");
-        assert_eq!(
-            std::fs::read_to_string(dir.join("fw.json")).unwrap(),
-            r#"{"a":1}"#
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.join("fw.yaml")).unwrap(),
-            "a: 1\n"
-        );
-        assert_no_tmps(&dir);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Crash-window proxy: block the YAML rename (a directory where the file
-    /// must go — fails even as root, unlike permission bits) and assert the
-    /// JSON half is NOT left behind with new content.
-    #[test]
-    fn test_publish_pair_failure_leaves_no_half_pair() {
-        let dir = scratch_dir("half");
-        std::fs::create_dir(dir.join("fw.yaml")).expect("blocker dir must be creatable");
-
-        let err = publish_parser_pair(&dir, "fw.json", "fw.yaml", "NEW-JSON", "NEW-YAML")
-            .expect_err("YAML rename onto a directory must fail");
-        let _ = err;
-
-        assert!(
-            !dir.join("fw.json").exists(),
-            "failed publish must not leave the JSON half behind"
-        );
-        // The blocker itself is untouched — rollback removes files, never dirs.
-        assert!(dir.join("fw.yaml").is_dir());
-        assert_no_tmps(&dir);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Same failure, but a parser was already published: the JSON target
-    /// must be rolled back to its PRIOR contents, not deleted, and the YAML
-    /// prior must be intact.
-    #[test]
-    fn test_publish_pair_failure_restores_prior() {
-        let dir = scratch_dir("rollback");
-        std::fs::write(dir.join("fw.json"), "OLD-JSON").unwrap();
-        std::fs::write(dir.join("fw.yaml"), "OLD-YAML").unwrap();
-        // Re-publish over the pair first: proves overwrite works mid-test.
-        publish_parser_pair(&dir, "fw.json", "fw.yaml", "MID-JSON", "MID-YAML").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("fw.json")).unwrap(),
-            "MID-JSON"
-        );
-
-        // Now block the YAML target and re-publish: JSON rename succeeds,
-        // YAML rename fails, JSON must roll back to MID-JSON.
-        std::fs::remove_file(dir.join("fw.yaml")).unwrap();
-        std::fs::create_dir(dir.join("fw.yaml")).unwrap();
-        publish_parser_pair(&dir, "fw.json", "fw.yaml", "NEW-JSON", "NEW-YAML")
-            .expect_err("blocked YAML rename must fail");
-        assert_eq!(
-            std::fs::read_to_string(dir.join("fw.json")).unwrap(),
-            "MID-JSON",
-            "JSON half must roll back to prior contents, not keep NEW-JSON"
-        );
-        assert!(dir.join("fw.yaml").is_dir());
-        assert_no_tmps(&dir);
-
-        // Unblock and prove the pair still publishes cleanly afterwards.
-        std::fs::remove_dir(dir.join("fw.yaml")).unwrap();
-        publish_parser_pair(&dir, "fw.json", "fw.yaml", "NEW-JSON", "NEW-YAML").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("fw.json")).unwrap(),
-            "NEW-JSON"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.join("fw.yaml")).unwrap(),
-            "NEW-YAML"
-        );
-        assert_no_tmps(&dir);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// A rollback that completes cleanly must report ONLY the publish failure.
-    ///
-    /// The half that renamed successfully no longer has a temp file, so
-    /// `remove_file` on it returns `NotFound` — which is the expected case, not
-    /// a rollback problem. Counting it made every clean rollback report itself
-    /// as incomplete, which would train operators to ignore that signal.
-    #[test]
-    fn test_publish_pair_clean_rollback_reports_only_publish_failure() {
-        let dir = scratch_dir("cleanrollback");
-        std::fs::write(dir.join("fw.json"), "OLD-JSON").unwrap();
-        std::fs::create_dir(dir.join("fw.yaml")).expect("blocker dir must be creatable");
-
-        let err = publish_parser_pair(&dir, "fw.json", "fw.yaml", "NEW-JSON", "NEW-YAML")
-            .expect_err("blocked YAML rename must fail");
-        let msg = err.to_string();
-        assert!(
-            !msg.contains("rollback was incomplete"),
-            "a rollback that restored cleanly must NOT claim incompleteness: {msg}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.join("fw.json")).unwrap(),
-            "OLD-JSON",
-            "prior contents must be back"
-        );
-        assert_no_tmps(&dir);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// An UNREADABLE prior file must never be deleted by a rollback.
-    ///
-    /// The snapshot used to be `fs::read(..).ok()`, which collapses "no file
-    /// there" and "the file is there but I could not read it" into the same
-    /// `None` — and the rollback deletes on `None`. So a parser that existed
-    /// but was unreadable at snapshot time (bad ownership after a restore from
-    /// another host, a transient I/O error, a file that is not a regular file)
-    /// would have been DELETED when the publish failed, not restored. Losing a
-    /// working parser because an unrelated write failed is the worst possible
-    /// outcome of a rollback.
-    ///
-    /// A unix socket file is the deterministic stand-in for "exists, will not
-    /// read": `read` fails `ENXIO`, which is not `NotFound`, while a rename over
-    /// it succeeds, so the publish really does proceed and really does fail
-    /// afterwards. A `chmod 000` file would be simpler but is unreliable — as
-    /// root it is still readable, and this suite is documented to run as root.
-    #[cfg(unix)]
-    #[test]
-    fn test_publish_pair_never_deletes_an_unreadable_prior_file() {
-        use std::os::unix::net::UnixListener;
-
-        let dir = scratch_dir("unreadable-prior");
-        // Prior "parser" that cannot be read...
-        let json_path = dir.join("fw.json");
-        let listener = UnixListener::bind(&json_path).expect("socket path must be bindable");
-        // ...and a YAML target that cannot be renamed over, to force the
-        // failure that triggers the rollback.
-        std::fs::create_dir(dir.join("fw.yaml")).expect("blocker dir must be creatable");
-
-        let err = publish_parser_pair(&dir, "fw.json", "fw.yaml", "NEW-JSON", "NEW-YAML")
-            .expect_err("blocked YAML rename must fail");
-        let msg = err.to_string();
-
-        assert!(
-            msg.contains("rollback was incomplete"),
-            "an unrestorable prior file must be reported, not swallowed: {msg}"
-        );
-        assert!(
-            msg.contains("could not read the prior file"),
-            "the error must name the reason: {msg}"
-        );
-
-        // The file must still be there, holding the new content. This is the
-        // whole point: a rollback that deleted an unreadable prior file would
-        // leave the path GONE, taking a parser definition with it. Leaving the
-        // new content in place loses nothing that was readable, and the
-        // incompleteness is reported above so an operator can reconcile it.
-        assert!(
-            json_path.exists(),
-            "the prior file was DELETED instead of left in place"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&json_path).unwrap(),
-            "NEW-JSON",
-            "the new content must be intact, not truncated or removed"
-        );
-
-        drop(listener);
-        std::fs::remove_file(&json_path).ok();
-        assert_no_tmps(&dir);
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

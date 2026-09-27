@@ -700,100 +700,175 @@ impl Onboarder {
             return Err(anyhow!("Empty sample lines provided"));
         }
 
-        let mut parts = Vec::new();
-        // Which endpoint/port *slot* the next column fills. These pick the
-        // preferred name; `taken` below decides whether it is still available.
-        let mut ip_count = 0;
-        let mut port_count = 0;
-
-        // A capture-group name may appear AT MOST ONCE in a pattern: `Regex::new`
-        // rejects duplicates outright, so a second `src_port` does not degrade
-        // the capture, it makes the whole pattern uncompilable — and
-        // `validate_parser` then rejects the pattern the synthesizer just
-        // produced, failing onboarding on a log shape the user cannot see the
-        // problem with. Every branch below therefore routes through `take`,
-        // which downgrades a repeat to a non-capturing group. Per-branch
-        // counters alone cannot see the collision: a standalone `443` column
-        // and a `10.0.0.1:1000` column both want `src_port`, and they are
-        // counted independently.
-        let mut taken: HashSet<&'static str> = HashSet::new();
-        let mut take = |name: &'static str, body: &str| -> String {
-            if taken.insert(name) {
-                format!("(?P<{name}>{body})")
-            } else {
-                format!("(?:{body})")
-            }
-        };
-
         // Class bodies for captured columns. Deliberately loose — the
-        // classifier above already proved the training tokens are real
+        // classifier below already proved the training tokens are real
         // addresses, and `IpAddr::from_str` re-checks at parse time.
-        const IP_BODY: &str = "[0-9a-fA-F.:%]+";
+        const IP_BODY: &str = r"[0-9a-fA-F.:%]+";
         const PORT_BODY: &str = r"\d{1,5}";
 
+        /// What a single column turned out to be, decided before any name is
+        /// handed out. See the two-pass comment below for why classification
+        /// cannot be fused with emission.
+        enum Col {
+            /// Same token in every sample: a static anchor, emitted escaped.
+            Literal(String),
+            Timestamp,
+            /// `IP:port` / `IP/port`, where the address half really parses and
+            /// the whole token is not itself a valid address — so `2001:db8::1`
+            /// and `::443` stay whole bare IPv6 captures. The bool is "uses a
+            /// colon".
+            IpPort(bool),
+            Port,
+            Ip,
+            Proto,
+            Action,
+            Opaque,
+        }
+
+        // ---- Pass 1: classify every column -------------------------------
+        //
+        // A capture-group name may appear AT MOST ONCE in a pattern: `Regex::new`
+        // rejects duplicates outright, so a second `src_port` does not degrade a
+        // capture, it makes the whole pattern uncompilable — and `validate_parser`
+        // then rejects the pattern the synthesizer just produced, failing
+        // onboarding on a log shape the operator cannot see the problem with.
+        let mut kinds: Vec<Col> = Vec::with_capacity(min_len);
         for i in 0..min_len {
             let col: Vec<&str> = split_lines.iter().map(|l| l[i]).collect();
             let all_same = col.windows(2).all(|w| w[0] == w[1]);
-
-            if all_same {
-                // Static anchor token: escape special regex characters
-                parts.push(regex::escape(col[0]));
+            kinds.push(if all_same {
+                Col::Literal(regex::escape(col[0]))
             } else if col.iter().all(|t| re_timestamp.is_match(t)) {
-                parts.push(take("timestamp", r"\S+"));
+                Col::Timestamp
             } else if col.iter().all(|t| is_ip_port(t)) {
-                // Genuine `IP:port` / `IP/port`, where the address half really
-                // parses AND the whole token is not itself a valid address (so
-                // `2001:db8::1` and `::443` stay whole bare IPv6 captures).
-                let delimiter = if col[0].contains(':') { ":" } else { "/" };
-                if ip_count < 2 {
-                    let (ip_name, port_name) = if ip_count == 0 {
-                        ("src_ip", "src_port")
-                    } else {
-                        ("dst_ip", "dst_port")
-                    };
-                    // Either name may already be spent by an earlier column of
-                    // the other kind; `take` downgrades just that half, so the
-                    // address is still captured even when its port is not.
-                    let ip = take(ip_name, IP_BODY);
-                    let port = take(port_name, PORT_BODY);
-                    parts.push(format!("{ip}{delimiter}{port}"));
-                    ip_count += 1;
-                    port_count += 1;
-                } else {
-                    parts.push(format!(r"{IP_BODY}{delimiter}\d{{1,5}}"));
-                }
+                Col::IpPort(col[0].contains(':'))
             } else if col.iter().all(|t| re_port.is_match(t)) {
-                // Order relative to the IP branches is not load-bearing for
-                // correctness — `is_ip` is real address validation, so `443` is
-                // simply not an address. It is kept ahead of them so a port
-                // column is classified as a port instead of falling through to
-                // the generic non-capturing fallback.
-                if port_count < 2 {
-                    let name = if port_count == 0 {
-                        "src_port"
-                    } else {
-                        "dst_port"
-                    };
-                    parts.push(take(name, PORT_BODY));
-                    port_count += 1;
-                } else {
-                    parts.push(r"(?:\d{1,5})".to_string());
-                }
+                Col::Port
             } else if col.iter().all(|t| is_ip(t)) {
-                if ip_count < 2 {
-                    let name = if ip_count == 0 { "src_ip" } else { "dst_ip" };
-                    parts.push(take(name, IP_BODY));
-                    ip_count += 1;
-                } else {
-                    parts.push(IP_BODY.to_string());
-                }
+                Col::Ip
             } else if col.iter().all(|t| re_proto.is_match(t)) {
-                parts.push(take("protocol", r"[a-zA-Z0-9]+"));
+                Col::Proto
             } else if col.iter().all(|t| re_action.is_match(t)) {
-                parts.push(take("action", r"[a-zA-Z]+"));
+                Col::Action
             } else {
-                parts.push(r"(?:\S+)".to_string());
+                Col::Opaque
+            });
+        }
+
+        // ---- Pass 2: hand out names, priority order ----------------------
+        //
+        // Names are allocated across ALL columns before a single group is
+        // emitted, because the order columns are *seen* is not the order they
+        // should be *served*. A bare `443` column and a `10.0.0.1:1000` column
+        // both want a port, and if the bare one is served first on sight it
+        // takes `dst_port` — leaving the real `10.0.0.2:2000` to be emitted
+        // uncaptured, and reporting that unrelated `443` as the destination's
+        // port. That is worse than the duplicate-name bug this replaced: the
+        // pattern compiles, `validate_parser` passes it (22 is a valid u16), and
+        // the store permanently records a wrong endpoint at confidence 1.0.
+        //
+        // So: endpoint columns claim their slots first, in column order, and
+        // standalone port columns fill whatever is left over. A port that cannot
+        // be named is emitted uncaptured — a field that is not extracted, which
+        // is honest, instead of a field bound to the wrong column, which is not.
+        #[derive(Clone, Copy, Default)]
+        struct Assigned {
+            ip: Option<&'static str>,
+            port: Option<&'static str>,
+            single: Option<&'static str>,
+        }
+        let mut assigned = vec![Assigned::default(); min_len];
+        let mut ip_slot = 0usize;
+        let mut port_slot = 0usize;
+        let slots = |slot: &mut usize, table: &[&'static str]| -> Option<&'static str> {
+            let name = table.get(*slot).copied();
+            if name.is_some() {
+                *slot += 1;
             }
+            name
+        };
+        const IP_SLOTS: [&str; 2] = ["src_ip", "dst_ip"];
+        const PORT_SLOTS: [&str; 2] = ["src_port", "dst_port"];
+
+        // Endpoint columns first.
+        for (i, kind) in kinds.iter().enumerate() {
+            match kind {
+                Col::IpPort(_) => {
+                    assigned[i].ip = slots(&mut ip_slot, &IP_SLOTS);
+                    assigned[i].port = slots(&mut port_slot, &PORT_SLOTS);
+                }
+                Col::Ip => assigned[i].ip = slots(&mut ip_slot, &IP_SLOTS),
+                _ => {}
+            }
+        }
+        // Then standalone port columns, with whatever the endpoints left.
+        for (i, kind) in kinds.iter().enumerate() {
+            if matches!(kind, Col::Port) {
+                assigned[i].port = slots(&mut port_slot, &PORT_SLOTS);
+            }
+        }
+        // Cosmetic singletons: a repeat is downgraded silently. Missing a
+        // second timestamp or an outer protocol name costs a field, not a
+        // verdict, so there is nothing to be loud about.
+        let mut seen_single: HashSet<&'static str> = HashSet::new();
+        for (i, kind) in kinds.iter().enumerate() {
+            assigned[i].single = match kind {
+                Col::Timestamp => seen_single.insert("timestamp").then_some("timestamp"),
+                Col::Proto => seen_single.insert("protocol").then_some("protocol"),
+                // NOT downgraded. `action` alone decides `disposition` and
+                // `activity_id`, so a second action-bearing column means the
+                // line carries two verdicts. Silently keeping one of them turns
+                // "these disagree" into a confident single answer — an
+                // `ALLOW`/`DENY` conflation. Refusing to guess is the only safe
+                // behaviour: onboarding fails loudly with the column index, and
+                // the operator supplies samples that do not conflate the fields
+                // or writes the parser by hand.
+                Col::Action if !seen_single.insert("action") => {
+                    return Err(anyhow!(
+                        "column {} classifies as an action but column {} already holds \
+                         `action`; this format carries two security verdicts per line and a \
+                         single `action` capture would report one of them as the disposition. \
+                         Remove the ambiguous column from the samples, or define the parser \
+                         manually with distinct group names.",
+                        i + 1,
+                        kinds
+                            .iter()
+                            .position(|k| matches!(k, Col::Action))
+                            .map_or(0, |p| p + 1)
+                    ));
+                }
+                Col::Action => Some("action"),
+                _ => None,
+            };
+        }
+
+        // ---- Pass 3: emit, in column order -------------------------------
+        let named = |name: Option<&'static str>, body: &str| -> String {
+            match name {
+                Some(n) => format!("(?P<{n}>{body})"),
+                None => format!("(?:{body})"),
+            }
+        };
+        let mut parts = Vec::with_capacity(min_len);
+        for (i, kind) in kinds.iter().enumerate() {
+            let a = &assigned[i];
+            parts.push(match kind {
+                Col::Literal(lit) => lit.clone(),
+                Col::Timestamp => named(a.single, r"\S+"),
+                Col::IpPort(colon) => {
+                    let delim = if *colon { ":" } else { "/" };
+                    format!(
+                        "{}{delim}{}",
+                        named(a.ip, IP_BODY),
+                        named(a.port, PORT_BODY)
+                    )
+                }
+                Col::Port => named(a.port, PORT_BODY),
+                Col::Ip => named(a.ip, IP_BODY),
+                Col::Proto => named(a.single, r"[a-zA-Z0-9]+"),
+                Col::Action => named(a.single, r"[a-zA-Z]+"),
+                Col::Opaque => r"(?:\S+)".to_string(),
+            });
         }
 
         let mut regex_str = String::from("^");
@@ -1099,15 +1174,14 @@ mod tests {
     /// makes the pattern uncompilable, and `validate_parser` then rejects the
     /// pattern the synthesizer just produced.
     ///
-    /// The dangerous case is two column *kinds* competing for one name. A
-    /// standalone `443` column and a `10.0.0.1:1000` column both want
-    /// `src_port`, and they are counted by independent counters, so per-branch
-    /// counting cannot see the collision. Every branch routes through one
-    /// `take` budget instead, and the second claimant is downgraded to a
-    /// non-capturing group.
+    /// Each case is a real log shape whose columns collide on a name, either
+    /// because two columns of one kind compete, or because two *kinds* compete
+    /// for the same slot.
     #[test]
     fn test_positional_synthesizer_never_emits_duplicate_group_names() {
-        // Each case is a real log shape whose columns collide on a name.
+        // Each case: (label, samples). Names that carry no security meaning
+        // (`timestamp`, `protocol`) may be silently downgraded; a name that
+        // does (`action`) is a hard error and is covered by its own test.
         let cases: Vec<(&str, Vec<&str>)> = vec![
             (
                 "standalone port column, then addr:port columns",
@@ -1142,11 +1216,11 @@ mod tests {
                 ],
             ),
             (
-                "two varying action columns",
+                "three bare ip columns, so the third has no slot",
                 vec![
-                    "10.0.0.1 10.0.0.2 TCP accept deny",
-                    "10.0.0.3 10.0.0.4 TCP drop block",
-                    "10.0.0.5 10.0.0.6 TCP pass reject",
+                    "10.0.0.1 10.0.0.2 10.0.0.3 443 TCP accept",
+                    "10.0.0.4 10.0.0.5 10.0.0.6 444 TCP accept",
+                    "10.0.0.7 10.0.0.8 10.0.0.9 445 TCP accept",
                 ],
             ),
         ];
@@ -1154,9 +1228,19 @@ mod tests {
         for (label, samples) in cases {
             let pattern =
                 Onboarder::synthesize_regex(&samples).unwrap_or_else(|e| panic!("{label}: {e}"));
-            Regex::new(&pattern).unwrap_or_else(|e| {
+            let re = Regex::new(&pattern).unwrap_or_else(|e| {
                 panic!("{label} produced an uncompilable pattern: {e}\n  {pattern}")
             });
+            // Belt and braces: a name that survives `Regex::new` is unique by
+            // construction, so assert the invariant at the boundary rather
+            // than trusting the allocator.
+            let mut seen = std::collections::HashSet::new();
+            for n in re.capture_names().flatten() {
+                assert!(
+                    seen.insert(n),
+                    "{label}: capture name {n:?} appears more than once in {pattern}"
+                );
+            }
             // Compiling is not enough — the pattern must also survive the
             // validator, or onboarding fails on the user's own samples.
             let def = ParserDefinition {
@@ -1179,26 +1263,195 @@ mod tests {
         }
     }
 
-    /// Downgrading a repeat capture must not lose the OTHER half of the pair. A
-    /// standalone port column spends `src_port`; the following `addr:port`
-    /// column must still capture its ADDRESS even though its port name is gone.
+    /// A port name must never be bound to a column it does not describe.
+    ///
+    /// This is the failure the first cut of the duplicate-name fix introduced,
+    /// and it is worse than the bug it replaced. Serving columns in sight-order
+    /// meant a bare `22` seen between two `IP:port` columns claimed `dst_port`,
+    /// while the real `10.0.0.2:2000` was emitted uncaptured. The pattern then
+    /// COMPILED, `validate_parser` accepted it (22 is a valid u16), and the
+    /// definition was published at `confidence_score: 1.0` reporting
+    /// `dst_port = 22` for an endpoint whose port is 2000. A duplicate name was
+    /// a loud onboarding failure; this is a permanent, confident, wrong fact in
+    /// the store.
+    ///
+    /// Endpoint columns therefore claim their slots first, and a standalone
+    /// port that cannot be named is left uncaptured — a field that is not
+    /// extracted, which is honest, rather than one bound to the wrong column.
     #[test]
-    fn test_duplicate_name_downgrade_keeps_the_other_capture() {
+    fn test_positional_port_names_bind_to_the_column_they_describe() {
+        // The standalone `22` / `23` / `24` column is an unrelated field. It must
+        // not be reported as the destination port.
         let samples = vec![
-            "host 443 10.0.0.1:1000 10.0.0.2:2000 TCP accept",
-            "host 444 10.0.0.3:1001 10.0.0.4:2001 TCP accept",
-            "host 445 10.0.0.5:1002 10.0.0.6:2002 TCP accept",
+            "10.0.0.1:1000 22 10.0.0.2:2000 TCP accept",
+            "10.0.0.3:1001 23 10.0.0.4:2001 TCP accept",
+            "10.0.0.5:1002 24 10.0.0.6:2002 TCP accept",
         ];
         let pattern = Onboarder::synthesize_regex(&samples).unwrap();
         let re = Regex::new(&pattern).unwrap();
         let caps = re.captures(samples[0]).unwrap();
-        // The standalone column owns src_port.
-        assert_eq!(caps.name("src_port").map(|m| m.as_str()), Some("443"));
-        // The addr:port column still yields its address — dropping the whole
-        // column to a non-capturing group would be a silent field loss.
-        assert_eq!(caps.name("src_ip").map(|m| m.as_str()), Some("10.0.0.1"));
-        assert_eq!(caps.name("dst_ip").map(|m| m.as_str()), Some("10.0.0.2"));
-        assert_eq!(caps.name("dst_port").map(|m| m.as_str()), Some("2000"));
+        let got = |n: &str| caps.name(n).map(|m| m.as_str().to_string());
+
+        assert_eq!(got("src_ip").as_deref(), Some("10.0.0.1"));
+        assert_eq!(
+            got("src_port").as_deref(),
+            Some("1000"),
+            "src_port must be the port from the source's own addr:port column"
+        );
+        assert_eq!(got("dst_ip").as_deref(), Some("10.0.0.2"));
+        assert_eq!(
+            got("dst_port").as_deref(),
+            Some("2000"),
+            "dst_port must be the port from the DESTINATION's addr:port column, \
+             never an unrelated standalone port column"
+        );
+
+        // And the symmetric case: standalone ports on BOTH sides of two
+        // addr:port columns. Both standalone columns go uncaptured; neither
+        // endpoint's real port is displaced.
+        let samples = vec![
+            "443 10.0.0.1:1000 80 10.0.0.2:2000 TCP accept",
+            "444 10.0.0.3:1001 81 10.0.0.4:2001 TCP accept",
+            "445 10.0.0.5:1002 82 10.0.0.6:2002 TCP accept",
+        ];
+        let caps = Regex::new(&Onboarder::synthesize_regex(&samples).unwrap())
+            .unwrap()
+            .captures(samples[0])
+            .unwrap();
+        let got = |n: &str| caps.name(n).map(|m| m.as_str().to_string());
+        assert_eq!(got("src_port").as_deref(), Some("1000"));
+        assert_eq!(got("dst_port").as_deref(), Some("2000"));
+    }
+
+    /// A standalone port column still fills a slot when nothing else wants it.
+    ///
+    /// The counterpart to the test above: the priority pass must not *starve*
+    /// standalone ports. In `443 10.0.0.1 80 10.0.0.2` there is no addr:port
+    /// column at all, so the two bare ports are the only port evidence and must
+    /// be captured rather than dropped.
+    #[test]
+    fn test_positional_standalone_ports_are_captured_when_nothing_else_claims_the_slot() {
+        let samples = vec![
+            "443 10.0.0.1 80 10.0.0.2 TCP accept",
+            "444 10.0.0.3 81 10.0.0.4 TCP accept",
+            "445 10.0.0.5 82 10.0.0.6 TCP accept",
+        ];
+        let pattern = Onboarder::synthesize_regex(&samples).unwrap();
+        let caps = Regex::new(&pattern).unwrap().captures(samples[0]).unwrap();
+        let got = |n: &str| caps.name(n).map(|m| m.as_str().to_string());
+        assert_eq!(got("src_port").as_deref(), Some("443"));
+        assert_eq!(got("src_ip").as_deref(), Some("10.0.0.1"));
+        assert_eq!(got("dst_port").as_deref(), Some("80"));
+        assert_eq!(got("dst_ip").as_deref(), Some("10.0.0.2"));
+    }
+
+    /// Two action-bearing columns must REFUSE to onboard, not pick one.
+    ///
+    /// `action` alone determines `disposition` and `activity_id`. A line
+    /// carrying two verdicts (`accept deny`) cannot be represented by one
+    /// capture, and silently keeping the first turns "these disagree" into a
+    /// confident single answer — an `ALLOW`/`DENY` conflation, which is the one
+    /// direction of error this framework must never take silently. Onboarding
+    /// failing loudly, with both column indices named, is the safe outcome: the
+    /// operator can disambiguate the samples or write the parser by hand.
+    ///
+    /// This is deliberately NOT symmetric with `protocol` or `timestamp`. Those
+    /// cost a field; this costs a verdict.
+    #[test]
+    fn test_positional_two_action_columns_fail_loudly_rather_than_pick_one() {
+        let samples = vec![
+            "10.0.0.1 10.0.0.2 TCP accept deny",
+            "10.0.0.3 10.0.0.4 TCP drop block",
+            "10.0.0.5 10.0.0.6 TCP pass reject",
+        ];
+        let err = Onboarder::synthesize_regex(&samples)
+            .expect_err("two security verdicts must not collapse into one `action` capture");
+        let msg = err.to_string();
+        // The message has to be actionable: which two columns, and what to do.
+        assert!(
+            msg.contains("column 5"),
+            "must name the second column: {msg}"
+        );
+        assert!(
+            msg.contains("column 4"),
+            "must name the first column: {msg}"
+        );
+        assert!(
+            msg.contains("action"),
+            "must name the contended capture: {msg}"
+        );
+
+        // And it must not be reachable through the public entry point either.
+        let err = Onboarder::generate_parser("vendor", "model", &samples)
+            .expect_err("generate_parser must surface the refusal");
+        assert!(
+            err.to_string().contains("action"),
+            "the public API must carry the reason: {err}"
+        );
+    }
+
+    /// Every emitting branch of the synthesizer must produce a compilable
+    /// pattern with unique capture names.
+    ///
+    /// The name budget protects `synthesize_positional_regex` only. The flow
+    /// and key-value synthesizers hand-write their groups and rely on being
+    /// duplicate-free by inspection, and `static_re` is applied to their probe
+    /// patterns but never to the literals they emit. That is exactly the kind
+    /// of invariant that a future edit reintroduces the original bug through —
+    /// adding `(?P<action>...)` to a flow pattern that already emits
+    /// `(?P<action_verb>...)`, for instance. Pinning it here means the check
+    /// does not depend on anyone having read every branch.
+    #[test]
+    fn test_no_synthesizer_branch_emits_a_duplicate_capture_name() {
+        let cases: Vec<(&str, Vec<&str>)> = vec![
+            (
+                "positional",
+                vec![
+                    "host 443 10.0.0.1:1000 10.0.0.2:2000 TCP accept",
+                    "host 444 10.0.0.3:1001 10.0.0.4:2001 TCP accept",
+                ],
+            ),
+            (
+                "key-value",
+                vec![
+                    "action=accept src=10.0.0.1 dst=10.0.0.2 sport=1234 dport=443 proto=tcp",
+                    "action=deny src=10.0.0.3 dst=10.0.0.4 sport=1235 dport=80 proto=udp",
+                ],
+            ),
+            (
+                "flow with -> arrow",
+                vec![
+                    "10.0.0.1 -> 10.0.0.2 proto=TCP action=accept",
+                    "10.0.0.3 -> 10.0.0.4 proto=UDP action=deny",
+                ],
+            ),
+            (
+                "flow with colon separator",
+                vec![
+                    "10.0.0.1: 10.0.0.2 TCP allow",
+                    "10.0.0.3: 10.0.0.4 UDP deny",
+                ],
+            ),
+            (
+                "flow with slash separator",
+                vec!["10.0.0.1/10.0.0.2 TCP allow", "10.0.0.3/10.0.0.4 UDP deny"],
+            ),
+        ];
+
+        for (label, samples) in cases {
+            let pattern = Onboarder::synthesize_regex(&samples)
+                .unwrap_or_else(|e| panic!("{label}: {e}\n  samples: {samples:?}"));
+            let re = Regex::new(&pattern).unwrap_or_else(|e| {
+                panic!("{label} produced an uncompilable pattern: {e}\n  {pattern}")
+            });
+            let mut seen = std::collections::HashSet::new();
+            for n in re.capture_names().flatten() {
+                assert!(
+                    seen.insert(n),
+                    "{label}: capture name {n:?} appears more than once\n  {pattern}"
+                );
+            }
+        }
     }
 
     /// A positional format with 3+ ip/port columns must never reuse a capture
