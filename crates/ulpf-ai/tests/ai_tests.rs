@@ -739,6 +739,7 @@ fn test_pinned_order_native_wins_over_registry() {
         sample_logs: vec![],
         confidence_score: 1.0,
         created_at: 0,
+        schema_version: 0,
         regex_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     {

@@ -13,6 +13,14 @@ use ulpf_core::schema::ocsf::{
     activity_id, disposition, ConnectionInfo, Endpoint, Metadata, NetworkActivity, Product,
 };
 
+/// Schema version stamped on every synthesized parser definition.
+///
+/// Bumped whenever the `ParserDefinition` serialization shape changes so
+/// loaders can distinguish current files from legacy ones. Deserialization
+/// defaults a missing field to 0 (see the `#[serde(default)]` on
+/// [`ParserDefinition::schema_version`]), so parsers published before this
+/// field existed keep loading — they just report version 0.
+pub const PARSER_SCHEMA_VERSION: u32 = 1;
 /// Result of automated sandbox validation on synthesized parser
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ValidationReport {
@@ -55,6 +63,13 @@ pub struct ParserDefinition {
     pub sample_logs: Vec<String>,
     pub confidence_score: f64,
     pub created_at: i64,
+    /// Schema version of this definition. `#[serde(default)]` (→ 0 when
+    /// absent) is load-bearing, not laziness: `from_yaml` rejects missing
+    /// fields, so without the default every parser file published before this
+    /// field existed would stop loading. New files are stamped
+    /// [`PARSER_SCHEMA_VERSION`]; legacy files report 0.
+    #[serde(default)]
+    pub schema_version: u32,
     #[serde(skip)]
     pub regex_cache: Arc<OnceLock<Result<Regex, regex::Error>>>,
 }
@@ -69,6 +84,7 @@ impl Clone for ParserDefinition {
             sample_logs: self.sample_logs.clone(),
             confidence_score: self.confidence_score,
             created_at: self.created_at,
+            schema_version: self.schema_version,
             // A FRESH cell, deliberately: `regex_pattern` is public, so a clone
             // may re-pattern itself. Sharing the cell would leave the clone
             // silently parsing with the ORIGINAL pattern, disagreeing with the
@@ -396,6 +412,7 @@ impl Onboarder {
             sample_logs: samples.iter().map(|s| s.to_string()).collect(),
             confidence_score: 1.0,
             created_at: Utc::now().timestamp_millis(),
+            schema_version: PARSER_SCHEMA_VERSION,
             regex_cache: Arc::new(OnceLock::new()),
         };
         let report = Self::validate_parser(&parser_def, samples)?;
@@ -1284,6 +1301,7 @@ mod tests {
                 sample_logs: vec![],
                 confidence_score: 1.0,
                 created_at: 0,
+                schema_version: 0,
                 regex_cache: Arc::new(OnceLock::new()),
             };
             let report = Onboarder::validate_parser(&def, &samples)
@@ -1591,6 +1609,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            schema_version: 0,
             regex_cache: Arc::new(OnceLock::new()),
         };
         let samples = [
@@ -1618,6 +1637,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            schema_version: 0,
             regex_cache: Arc::new(OnceLock::new()),
         };
         let ev = parser.parse("src=2001:db8::1 dst=::443").unwrap();
@@ -1654,6 +1674,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            schema_version: 0,
             regex_cache: Arc::new(OnceLock::new()),
         };
         // First parse compiles + initializes the OnceLock.
@@ -1709,6 +1730,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            schema_version: 0,
             regex_cache: Arc::new(OnceLock::new()),
         };
         // Must not panic — a Result-returning pub fn must surface Err.
@@ -1759,6 +1781,7 @@ mod tests {
             sample_logs: vec!["line one".to_string(), "line two".to_string()],
             confidence_score: 0.95,
             created_at: 1_700_000_000_000,
+            schema_version: 0,
             regex_cache: Arc::new(OnceLock::new()),
         };
         let yaml = parser.to_yaml().unwrap();
@@ -1887,6 +1910,7 @@ mod tests {
             sample_logs: samples.clone(),
             confidence_score: 0.97,
             created_at: 1_700_000_000_000,
+            schema_version: 0,
             regex_cache: Arc::new(OnceLock::new()),
         };
 
@@ -2003,6 +2027,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            schema_version: 0,
             regex_cache: Arc::new(OnceLock::new()),
         };
         // 19/20 = 95% — must pass (old code required 100%).
@@ -2060,6 +2085,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            schema_version: 0,
             regex_cache: Arc::new(OnceLock::new()),
         };
         // 2 of 3 match = 66.7% — must FAIL below the relaxation floor.
@@ -2089,6 +2115,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            schema_version: 0,
             regex_cache: Arc::new(OnceLock::new()),
         };
         assert_eq!(reg.register(dead), "deadvendor:broken");
@@ -2111,6 +2138,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            schema_version: 0,
             regex_cache: Arc::new(OnceLock::new()),
         };
         for i in 0..REGISTRY_CAPACITY {
@@ -2161,6 +2189,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            schema_version: 0,
             regex_cache: Arc::new(OnceLock::new()),
         };
         for empty in [vec![], vec!["", "   ", "\t"]] {
@@ -2221,6 +2250,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            schema_version: 0,
             regex_cache: Arc::new(OnceLock::new()),
         };
         let report = Onboarder::validate_parser(&parser, &samples).unwrap();
@@ -2244,6 +2274,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            schema_version: 0,
             regex_cache: Arc::new(OnceLock::new()),
         };
 

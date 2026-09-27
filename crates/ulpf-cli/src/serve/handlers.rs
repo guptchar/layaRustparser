@@ -129,6 +129,14 @@ pub struct ParserItem {
     pub confidence_score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<i64>,
+    /// Definition schema version for onboarded parsers.
+    ///
+    /// `None` for native extractors and for rows that never deserialized —
+    /// there is no definition to version, and the sentinel is more honest than
+    /// a fabricated `1`. `skip_serializing_if` leaves the wire shape unchanged
+    /// for every other row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -688,6 +696,7 @@ fn parser_item_for(slug: &str, halves: &[(ParserFormat, std::path::PathBuf)]) ->
                 regex_pattern: Some(def.regex_pattern),
                 confidence_score: Some(def.confidence_score),
                 created_at: Some(def.created_at),
+                schema_version: Some(def.schema_version),
             }
         }
         None => {
@@ -703,6 +712,7 @@ fn parser_item_for(slug: &str, halves: &[(ParserFormat, std::path::PathBuf)]) ->
                 regex_pattern: None,
                 confidence_score: None,
                 created_at: None,
+                schema_version: None,
             }
         }
     }
@@ -741,6 +751,7 @@ pub async fn get_parsers(State(state): State<AppState>) -> Json<Vec<ParserItem>>
             regex_pattern: None,
             confidence_score: Some(1.0),
             created_at: None,
+            schema_version: None,
         });
     }
 
@@ -864,6 +875,7 @@ pub async fn post_parsers_test(
                 sample_logs: vec![raw.to_string()],
                 confidence_score: 1.0,
                 created_at: Utc::now().timestamp_millis(),
+                schema_version: 0,
                 regex_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
             };
             match def.parse_with_regex(&re, raw) {
@@ -1505,6 +1517,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            schema_version: 1,
             regex_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
         std::fs::write(dir.join("good.json"), good.to_json().unwrap()).unwrap();
@@ -1590,6 +1603,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            schema_version: 1,
             regex_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
         };
 
