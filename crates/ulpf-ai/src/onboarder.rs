@@ -1281,6 +1281,100 @@ mod tests {
         assert_eq!(back.created_at, parser.created_at);
     }
 
+    /// Backwards compatibility with files already on disk.
+    ///
+    /// The round-trip test above only proves the NEW emitter and NEW loader
+    /// agree with each other, which is worthless if every parser published by a
+    /// previous release stops loading. This pins the two shapes that exist in
+    /// the wild: the output of the hand-rolled emitter this PR replaced, and
+    /// `to_json` output, which the old loader accepted as "YAML" because it
+    /// tried `serde_json` first.
+    ///
+    /// The legacy fixture is the old emitter's output verbatim — double-quoted
+    /// scalars, 2-decimal `confidence_score`, bare integer `created_at`,
+    /// `sample_logs` as a quoted list.
+    #[test]
+    fn test_from_yaml_loads_legacy_emitter_output_and_json() {
+        let legacy = concat!(
+            "vendor: \"Fortinet\"\n",
+            "device_model: \"FortiGate\"\n",
+            "confidence_score: 1.00\n",
+            "created_at: 1700000000000\n",
+            "regex_pattern: \"^src=(?P<src_ip>[0-9.]+) dst=(?P<dst_ip>[0-9.]+)$\"\n",
+            "action_mappings:\n",
+            "  pass: \"Allowed\"\n",
+            "  deny: \"Blocked\"\n",
+            "sample_logs:\n",
+            "  - \"src=10.0.0.1 dst=10.0.0.2\"\n",
+            "  - \"src=10.0.0.3 dst=10.0.0.4\"\n",
+        );
+        let def = ParserDefinition::from_yaml(legacy)
+            .expect("a YAML file published by a previous release must still load");
+        assert_eq!(def.vendor, "Fortinet");
+        assert_eq!(def.device_model, "FortiGate");
+        assert_eq!(
+            def.regex_pattern,
+            r"^src=(?P<src_ip>[0-9.]+) dst=(?P<dst_ip>[0-9.]+)$"
+        );
+        assert_eq!(
+            def.action_mappings.get("deny").map(String::as_str),
+            Some("Blocked")
+        );
+        assert_eq!(def.sample_logs.len(), 2);
+        assert!((def.confidence_score - 1.0).abs() < f64::EPSILON);
+        assert_eq!(def.created_at, 1_700_000_000_000);
+        // And it must be usable, not merely parseable.
+        let ev = def
+            .parse("src=10.0.0.1 dst=10.0.0.2")
+            .expect("a legacy-loaded definition must still parse");
+        assert_eq!(ev.src_endpoint.ip.as_deref(), Some("10.0.0.1"));
+
+        // `to_json` output is valid YAML, and the old loader relied on that.
+        let json = def.to_json().unwrap();
+        let from_json_as_yaml = ParserDefinition::from_yaml(&json)
+            .expect("JSON is a YAML subset; from_yaml must keep accepting it");
+        assert_eq!(from_json_as_yaml.regex_pattern, def.regex_pattern);
+        assert_eq!(from_json_as_yaml.sample_logs, def.sample_logs);
+    }
+
+    /// A file missing fields now FAILS LOUDLY instead of loading as a dead
+    /// parser.
+    ///
+    /// The old loader defaulted every absent field, so `vendor: "Acme"` alone
+    /// produced a definition with an EMPTY `regex_pattern` — a parser that
+    /// matched nothing, was served by `GET /parsers` as active, and was
+    /// registered into the hot path. Rejecting the file is the point; the
+    /// machine-readable message is what makes it fixable.
+    #[test]
+    fn test_from_yaml_rejects_partial_definition_instead_of_defaulting() {
+        let err = ParserDefinition::from_yaml("vendor: \"Acme\"\n")
+            .expect_err("a definition with no regex_pattern must not load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("missing field"),
+            "the error must name the missing field so it can be fixed: {msg}"
+        );
+        // Any of the six absent fields is a valid diagnosis — the point is that
+        // it is reported, not which one comes first in the struct.
+        assert!(
+            [
+                "device_model",
+                "regex_pattern",
+                "action_mappings",
+                "sample_logs"
+            ]
+            .iter()
+            .any(|f| msg.contains(f)),
+            "error must name a field that is actually absent: {msg}"
+        );
+        // The anyhow context chain must survive: a bare "invalid YAML" is not
+        // actionable, the inner serde message is.
+        assert!(
+            msg.contains("ParserDefinition"),
+            "error must identify the type being deserialized: {msg}"
+        );
+    }
+
     /// Synthesizer must produce IPv6-capable patterns (flow-arrow format).
     #[test]
     fn test_synthesizer_flow_accepts_ipv6() {
