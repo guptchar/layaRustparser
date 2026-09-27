@@ -127,9 +127,26 @@ impl ParserDefinition {
 
         let now_ms = Utc::now().timestamp_millis();
 
-        // 1. Extract Endpoints
-        let src_ip = caps.name("src_ip").map(|m| m.as_str().to_string());
-        let dst_ip = caps.name("dst_ip").map(|m| m.as_str().to_string());
+        // 1. Extract Endpoints. A present endpoint capture must be a REAL
+        // address (`parse_ip`, i.e. `IpAddr::from_str` modulo the zone id) —
+        // the same check `validate_parser` applies. A pattern whose `src_ip`
+        // group captures `14:00` or any other non-address must fail the event,
+        // not file it under a garbage IP: bare IPv6 (`2001:db8::1`) passes
+        // intact, anything unparseable is an Err like a validation miss.
+        let src_ip_raw = caps.name("src_ip").map(|m| m.as_str());
+        if let Some(s) = src_ip_raw {
+            if parse_ip(s).is_none() {
+                anyhow::bail!("Invalid src_ip endpoint capture: '{s}'");
+            }
+        }
+        let dst_ip_raw = caps.name("dst_ip").map(|m| m.as_str());
+        if let Some(s) = dst_ip_raw {
+            if parse_ip(s).is_none() {
+                anyhow::bail!("Invalid dst_ip endpoint capture: '{s}'");
+            }
+        }
+        let src_ip = src_ip_raw.map(|s| s.to_string());
+        let dst_ip = dst_ip_raw.map(|s| s.to_string());
 
         let src_port = caps
             .name("src_port")
@@ -479,19 +496,15 @@ impl Onboarder {
             0.0
         };
 
-        // 95% threshold with warnings. Below MIN_SAMPLES_FOR_RELAXATION the
-        // gate stays strict (100%): at N=3 a single "allowed" failure is 33%,
-        // which is not a 95% rule — it is a rule that reads as one.
-        // At/above the floor, a genuine 95% ratio applies (1 failure at N=20).
-        // Zero evaluated samples always fails: an unvalidated parser must never
-        // be admitted, and `0 == 0` would otherwise report a vacuous 0.0% pass.
-        const MIN_SAMPLES_FOR_RELAXATION: usize = 20;
-        let passed = total > 0
-            && if total < MIN_SAMPLES_FOR_RELAXATION {
-                matched == total
-            } else {
-                (matched as f64 / total as f64) >= 0.95
-            };
+        // 95% gate as an integer rule: nonzero total, at most total/20
+        // failures. No float, no `max(1)`, no special-case floor — below 20
+        // samples `total / 20 == 0`, so the gate is strict (100%): at N=3 a
+        // single failure is 33%, which is not a 95% rule. At N=20 exactly one
+        // failure is allowed (19/20). Zero evaluated samples always fails: an
+        // unvalidated parser must never be admitted, and `0 == 0` would
+        // otherwise report a vacuous pass.
+        let failed = total - matched;
+        let passed = total > 0 && failed <= total / 20;
 
         Ok(ValidationReport {
             passed,
@@ -525,11 +538,10 @@ impl Onboarder {
 
     /// Synthesize regex for directional arrow flow formats (e.g. Juniper SRX `IP/PORT->IP/PORT`)
     fn synthesize_flow_regex(samples: &[&str]) -> Result<String> {
-        let re_flow_slash =
-            Regex::new(r"([0-9a-fA-F.:%]+)/(\d{1,5})->([0-9a-fA-F.:%]+)/(\d{1,5})").unwrap();
+        let re_flow_slash = static_re(r"([0-9a-fA-F.:%]+)/(\d{1,5})->([0-9a-fA-F.:%]+)/(\d{1,5})")?;
 
         let re_flow_colon =
-            Regex::new(r"([0-9a-fA-F.:%]+):(\d{1,5})\s*->\s*([0-9a-fA-F.:%]+):(\d{1,5})").unwrap();
+            static_re(r"([0-9a-fA-F.:%]+):(\d{1,5})\s*->\s*([0-9a-fA-F.:%]+):(\d{1,5})")?;
 
         let first = samples[0];
 
@@ -562,34 +574,34 @@ impl Onboarder {
         let key_patterns = vec![
             (
                 "action",
-                Regex::new(r"\b(?:action|act)=").unwrap(),
+                static_re(r"\b(?:action|act)=")?,
                 // Optional quotes: FortiGate writes `action="client-rst"` — the old
                 // `[a-zA-Z]+` neither tolerated quotes nor hyphens and failed validation.
                 r#"(?:action|act)="?(?P<action>[a-zA-Z0-9_-]+)"?"#,
             ),
             (
                 "src_ip",
-                Regex::new(r"\b(?:src|srcip|saddr)=").unwrap(),
+                static_re(r"\b(?:src|srcip|saddr)=")?,
                 r"(?:src|srcip|saddr)=(?P<src_ip>[0-9a-fA-F.:%]+)",
             ),
             (
                 "src_port",
-                Regex::new(r"\b(?:sport|srcport)=").unwrap(),
+                static_re(r"\b(?:sport|srcport)=")?,
                 r"(?:sport|srcport)=(?P<src_port>\d{1,5})",
             ),
             (
                 "dst_ip",
-                Regex::new(r"\b(?:dst|dstip|daddr)=").unwrap(),
+                static_re(r"\b(?:dst|dstip|daddr)=")?,
                 r"(?:dst|dstip|daddr)=(?P<dst_ip>[0-9a-fA-F.:%]+)",
             ),
             (
                 "dst_port",
-                Regex::new(r"\b(?:dport|dstport)=").unwrap(),
+                static_re(r"\b(?:dport|dstport)=")?,
                 r"(?:dport|dstport)=(?P<dst_port>\d{1,5})",
             ),
             (
                 "protocol",
-                Regex::new(r"\b(?:proto|protocol)=").unwrap(),
+                static_re(r"\b(?:proto|protocol)=")?,
                 r"(?:proto|protocol)=(?P<protocol>[a-zA-Z0-9]+)",
             ),
         ];
@@ -621,13 +633,11 @@ impl Onboarder {
 
     /// Synthesize regex via positional token alignment across sample lines
     fn synthesize_positional_regex(samples: &[&str]) -> Result<String> {
-        let re_ip_port = Regex::new(r"^([0-9a-fA-F.:%]+)[:/](\d{1,5})$").unwrap();
-        let re_port = Regex::new(r"^\d{1,5}$").unwrap();
-        let re_proto = Regex::new(r"^(?i)(TCP|UDP|ICMP|GRE|ESP|AH|IGMP|SCTP)$").unwrap();
-        let re_action =
-            Regex::new(r"^(?i)(accept|deny|drop|permit|block|reject|pass|allow)$").unwrap();
-        let re_timestamp =
-            Regex::new(r"^\d{4}[-/]\d{2}[-/]\d{2}(?:[T\s]\d{2}:\d{2}:\d{2})?$").unwrap();
+        let re_ip_port = static_re(r"^([0-9a-fA-F.:%]+)[:/](\d{1,5})$")?;
+        let re_port = static_re(r"^\d{1,5}$")?;
+        let re_proto = static_re(r"^(?i)(TCP|UDP|ICMP|GRE|ESP|AH|IGMP|SCTP)$")?;
+        let re_action = static_re(r"^(?i)(accept|deny|drop|permit|block|reject|pass|allow)$")?;
+        let re_timestamp = static_re(r"^\d{4}[-/]\d{2}[-/]\d{2}(?:[T\s]\d{2}:\d{2}:\d{2})?$")?;
 
         // Classification uses REAL address validation, never a character class.
         // A permissive `[0-9a-fA-F.:%]+` also matches a wall-clock `14:00:01`,
@@ -994,6 +1004,14 @@ fn parse_ip(raw: &str) -> Option<IpAddr> {
     IpAddr::from_str(unscoped).ok()
 }
 
+/// Compile a hard-coded synthesizer pattern. These literals are
+/// regression-tested, but `Regex::new` still returns `Result` — propagate it
+/// with `?` instead of `unwrap()` so a future typo in a literal surfaces as a
+/// diagnosable `Err` from `generate_parser`, never a panic on the onboard path.
+fn static_re(pattern: &str) -> Result<Regex> {
+    Regex::new(pattern).with_context(|| format!("Invalid hard-coded regex: {pattern}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1060,6 +1078,44 @@ mod tests {
         let report = Onboarder::validate_parser(&parser, &samples).unwrap();
         assert!(report.passed, "IPv6 must pass: {:?}", report.errors);
         assert_eq!(report.match_percentage, 100.0);
+    }
+
+    /// Runtime extraction stays consistent with validation: a bare IPv6
+    /// address captured as `src_ip`/`dst_ip` parses intact (no IPv4-only
+    /// assumption may mangle or reject it), while a non-address in an
+    /// endpoint capture is an Err — the same verdict `validate_parser`
+    /// renders for that sample.
+    #[test]
+    fn test_parse_runtime_validates_endpoint_captures() {
+        let parser = ParserDefinition {
+            vendor: "test".into(),
+            device_model: "v6rt".into(),
+            regex_pattern: r"^src=(?P<src_ip>\S+) dst=(?P<dst_ip>\S+)$".to_string(),
+            action_mappings: HashMap::new(),
+            sample_logs: vec![],
+            confidence_score: 1.0,
+            created_at: 0,
+            regex_cache: Arc::new(OnceLock::new()),
+        };
+        let ev = parser.parse("src=2001:db8::1 dst=::443").unwrap();
+        assert_eq!(ev.src_endpoint.ip.as_deref(), Some("2001:db8::1"));
+        assert_eq!(ev.dst_endpoint.ip.as_deref(), Some("::443"));
+
+        // A wall-clock fragment in an endpoint capture must not file an
+        // event under a garbage IP.
+        let err = parser
+            .parse("src=14:00 dst=10.0.0.2")
+            .expect_err("non-address src_ip must Err, like a validation miss");
+        assert!(
+            err.to_string().contains("Invalid src_ip"),
+            "error must name the bad capture: {err}"
+        );
+        assert!(
+            parser.parse("src=10.0.0.1 dst=not-an-ip").is_err(),
+            "non-address dst_ip must Err too"
+        );
+        // Repeated bad-capture events stay Err, never panic.
+        assert!(parser.parse("src=14:00 dst=10.0.0.2").is_err());
     }
 
     /// Compiled regex is cached via Arc<OnceLock<Result<Regex, Error>>> — repeated
