@@ -658,7 +658,9 @@ pub async fn post_parsers_test(
                 created_at: Utc::now().timestamp_millis(),
                 regex_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
             };
-            def.parse(raw).ok()
+            // Reuse the `re` already compiled above instead of recompiling
+            // the same pattern inside the definition's cache.
+            def.parse_with_regex(&re, raw).ok()
         } else {
             None
         };
@@ -766,7 +768,20 @@ pub async fn post_onboard(
     }
 
     // Persist parser to data/parsers/
-    let _ = std::fs::create_dir_all(&state.parsers_dir);
+    // Surface the cause here rather than letting it resurface as a misleading
+    // "failed writing parser JSON" at the write below.
+    std::fs::create_dir_all(&state.parsers_dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Disk Write Error".to_string(),
+                code: 500,
+                message: format!("Failed creating parsers directory: {}", e),
+                block_id: None,
+                leaf_index: None,
+            }),
+        )
+    })?;
     let mut vendor_slug: String = payload
         .vendor
         .to_lowercase()

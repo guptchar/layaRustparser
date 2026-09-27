@@ -32,6 +32,12 @@ pub struct ValidationReport {
 pub struct ParserDefinition {
     pub vendor: String,
     pub device_model: String,
+    /// The synthesis pattern. **Treat as immutable after construction.**
+    /// `regex_cache` is a write-once `OnceLock`: if this field is mutated after
+    /// the first `parse()`, the cache keeps serving the ORIGINAL compiled
+    /// pattern (or keeps failing), silently disagreeing with the field — and
+    /// `to_json`/`to_yaml` would then serialize a pattern that is not applied.
+    /// Rebuild the definition instead of mutating it in place.
     pub regex_pattern: String,
     pub action_mappings: HashMap<String, String>,
     pub sample_logs: Vec<String>,
@@ -244,7 +250,7 @@ use uuid::Uuid;
 use chrono::Utc;
 
 pub struct __VENDOR____MODEL__Extractor {
-    regex: OnceLock<Regex>,
+    regex: OnceLock<Option<Regex>>,
 }
 
 impl __VENDOR____MODEL__Extractor {
@@ -253,9 +259,13 @@ impl __VENDOR____MODEL__Extractor {
     }
 
     pub fn parse(&self, raw: &str) -> anyhow::Result<NetworkActivity> {
-        let re = self.regex.get_or_init(|| {
-            Regex::new(r"__PATTERN__").expect("Invalid regex for __VENDOR__")
-        });
+        // Cache the compile FAILURE rather than panicking: this is a
+        // Result-returning fn and the pattern may be caller-supplied.
+        let re = self
+            .regex
+            .get_or_init(|| Regex::new(r"__PATTERN__").ok())
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Invalid regex for __VENDOR__"))?;
 
         let caps = re.captures(raw).ok_or_else(|| anyhow::anyhow!("Log match failed"))?;
         let now_ms = Utc::now().timestamp_millis();
@@ -353,8 +363,9 @@ impl Onboarder {
         Ok((parser_def, report))
     }
 
-    /// Automated Sandbox Validation: verifies ≥95% of samples match and extract valid IPs and ports.
-    /// Failures are surfaced as warnings in `errors`, not hard failures.
+    /// Automated Sandbox Validation: verifies samples match and extract valid
+    /// IPs and ports. Strict (100%) below 20 samples; ≥95% at/above 20, where
+    /// the residual failures are surfaced as warnings in `errors`.
     pub fn validate_parser(
         parser: &ParserDefinition,
         samples: &[&str],
@@ -366,7 +377,7 @@ impl Onboarder {
         let mut evaluated = 0;
         let mut errors = Vec::new();
 
-        for (idx, sample) in samples.iter().enumerate() {
+        for sample in samples {
             let line = sample.trim();
             if line.is_empty() {
                 continue;
@@ -378,8 +389,7 @@ impl Onboarder {
                 None => {
                     errors.push(format!(
                         "Sample #{} did not match regex pattern: '{}'",
-                        idx + 1,
-                        line
+                        evaluated, line
                     ));
                     continue;
                 }
@@ -389,11 +399,10 @@ impl Onboarder {
             let src_ip_opt = caps.name("src_ip").map(|m| m.as_str());
             match src_ip_opt {
                 Some(ip_str) => {
-                    if IpAddr::from_str(ip_str).is_err() {
+                    if parse_ip(ip_str).is_none() {
                         errors.push(format!(
                             "Sample #{}: invalid IP for src_ip: '{}'",
-                            idx + 1,
-                            ip_str
+                            evaluated, ip_str
                         ));
                         continue;
                     }
@@ -401,7 +410,7 @@ impl Onboarder {
                 None => {
                     errors.push(format!(
                         "Sample #{}: missing required capture group 'src_ip'",
-                        idx + 1
+                        evaluated
                     ));
                     continue;
                 }
@@ -411,11 +420,10 @@ impl Onboarder {
             let dst_ip_opt = caps.name("dst_ip").map(|m| m.as_str());
             match dst_ip_opt {
                 Some(ip_str) => {
-                    if IpAddr::from_str(ip_str).is_err() {
+                    if parse_ip(ip_str).is_none() {
                         errors.push(format!(
                             "Sample #{}: invalid IP for dst_ip: '{}'",
-                            idx + 1,
-                            ip_str
+                            evaluated, ip_str
                         ));
                         continue;
                     }
@@ -423,7 +431,7 @@ impl Onboarder {
                 None => {
                     errors.push(format!(
                         "Sample #{}: missing required capture group 'dst_ip'",
-                        idx + 1
+                        evaluated
                     ));
                     continue;
                 }
@@ -434,7 +442,7 @@ impl Onboarder {
                 if sp.as_str().parse::<u16>().is_err() {
                     errors.push(format!(
                         "Sample #{}: invalid port for src_port: '{}'",
-                        idx + 1,
+                        evaluated,
                         sp.as_str()
                     ));
                     continue;
@@ -445,7 +453,7 @@ impl Onboarder {
                 if dp.as_str().parse::<u16>().is_err() {
                     errors.push(format!(
                         "Sample #{}: invalid port for dst_port: '{}'",
-                        idx + 1,
+                        evaluated,
                         dp.as_str()
                     ));
                     continue;
@@ -462,11 +470,16 @@ impl Onboarder {
             0.0
         };
 
-        // 95% threshold with warnings — allows floor(N/20) failures so the
-        // relaxation is meaningful at any sample count (1 failure at N=20,
-        // 2 at N=40, etc.). Was: hard 100% + zero errors.
-        let max_failures = (total / 20).max(1);
-        let passed = (total - matched) <= max_failures;
+        // 95% threshold with warnings. Below MIN_SAMPLES_FOR_RELAXATION the
+        // gate stays strict (100%): at N=3 a single "allowed" failure is 33%,
+        // which is not a 95% rule — it is a rule that reads as one.
+        // At/above the floor, a genuine 95% ratio applies (1 failure at N=20).
+        const MIN_SAMPLES_FOR_RELAXATION: usize = 20;
+        let passed = if total < MIN_SAMPLES_FOR_RELAXATION {
+            matched == total
+        } else {
+            (matched as f64 / total as f64) >= 0.95
+        };
 
         Ok(ValidationReport {
             passed,
@@ -652,6 +665,19 @@ impl Onboarder {
                     // duplicate names make the regex fail to compile.
                     parts.push(format!(r"[0-9a-fA-F.:%]+{}\d{{1,5}}", delimiter));
                 }
+            } else if col.iter().all(|t| re_port.is_match(t)) {
+                // MUST precede the IP branch: the loose IP class includes
+                // 0-9, so `443` matches re_ip too. Testing IP first made this
+                // branch dead and silently dropped standalone port columns.
+                if port_count == 0 {
+                    parts.push(r"(?P<src_port>\d{1,5})".to_string());
+                    port_count += 1;
+                } else if port_count == 1 {
+                    parts.push(r"(?P<dst_port>\d{1,5})".to_string());
+                    port_count += 1;
+                } else {
+                    parts.push(r"(?:\d{1,5})".to_string());
+                }
             } else if col.iter().all(|t| re_ip.is_match(t)) {
                 if ip_count == 0 {
                     parts.push(r"(?P<src_ip>[0-9a-fA-F.:%]+)".to_string());
@@ -661,16 +687,6 @@ impl Onboarder {
                     ip_count += 1;
                 } else {
                     parts.push(r"[0-9a-fA-F.:%]+".to_string());
-                }
-            } else if col.iter().all(|t| re_port.is_match(t)) {
-                if port_count == 0 {
-                    parts.push(r"(?P<src_port>\d{1,5})".to_string());
-                    port_count += 1;
-                } else if port_count == 1 {
-                    parts.push(r"(?P<dst_port>\d{1,5})".to_string());
-                    port_count += 1;
-                } else {
-                    parts.push(r"(?:\d{1,5})".to_string());
                 }
             } else if col.iter().all(|t| re_proto.is_match(t)) {
                 parts.push(r"(?P<protocol>[a-zA-Z0-9]+)".to_string());
@@ -733,6 +749,10 @@ pub struct DynamicParserRegistry {
     parsers: BTreeMap<String, RegistryEntry>,
     clock: u64,
     capacity: usize,
+    /// Count of registrations whose `regex_pattern` failed to compile. Those
+    /// entries are stored but can never parse, so the count is surfaced on the
+    /// health surface rather than silently degrading the hot path.
+    failed_registrations: u64,
 }
 
 impl DynamicParserRegistry {
@@ -741,7 +761,14 @@ impl DynamicParserRegistry {
             parsers: BTreeMap::new(),
             clock: 0,
             capacity: REGISTRY_CAPACITY,
+            failed_registrations: 0,
         }
+    }
+
+    /// Number of parsers registered whose pattern never compiled. Non-zero means
+    /// `data/parsers/` holds at least one unusable definition.
+    pub fn failed_registrations(&self) -> u64 {
+        self.failed_registrations
     }
 
     fn tick(&mut self) -> u64 {
@@ -751,10 +778,21 @@ impl DynamicParserRegistry {
 
     /// Register a new parser definition dynamically. Returns the registry key
     /// (`vendor:device_model`) so callers can install a Tier-1 promotion route.
+    ///
+    /// An uncompilable `regex_pattern` is counted in [`Self::failed_registrations`]
+    /// instead of being silently swallowed: the entry is still stored (so the
+    /// key resolves) but its `regex` is `None` and it can never parse, so it must
+    /// not be mistaken for a working parser.
     #[must_use = "the registry key is needed to install a promotion route"]
     pub fn register(&mut self, parser: ParserDefinition) -> String {
         let key = format!("{}:{}", parser.vendor.to_lowercase(), parser.device_model);
-        let regex = Regex::new(&parser.regex_pattern).ok();
+        let regex = match Regex::new(&parser.regex_pattern) {
+            Ok(re) => Some(re),
+            Err(_) => {
+                self.failed_registrations += 1;
+                None
+            }
+        };
         let now = self.tick();
         if !self.parsers.contains_key(&key) && self.parsers.len() >= self.capacity {
             // LRU evict: least recently used, ties broken by lexicographically
@@ -814,28 +852,45 @@ impl DynamicParserRegistry {
 
     /// Parse with an exact registry key (Tier-1 dynamic route). Returns `None` when
     /// the key was evicted or the line no longer matches its pattern.
+    ///
+    /// `last_use` is stamped only on a real parse hit. Stamping before the
+    /// checks would let a dead entry (uncompilable pattern, or never-matching)
+    /// pin itself as most-recently-used and squat a capacity slot forever.
     pub fn parse_key(&mut self, key: &str, raw: &str) -> Option<NetworkActivity> {
+        let activity = {
+            let entry = self.parsers.get_mut(key)?;
+            let re = entry.regex.as_ref()?;
+            entry.parser.parse_with_regex(re, raw).ok()?
+        };
+        // `tick` takes `&mut self`, so stamp the clock first and re-borrow
+        // afterwards — the LRU write must not overlap the registry borrow.
         let now = self.tick();
-        let entry = self.parsers.get_mut(key)?;
-        entry.last_use = now;
-        let re = entry.regex.as_ref()?;
-        entry.parser.parse_with_regex(re, raw).ok()
+        if let Some(entry) = self.parsers.get_mut(key) {
+            entry.last_use = now;
+        }
+        Some(activity)
     }
 
     /// Attempt to parse a log line with any registered dynamic parser.
     /// Returns the winning key alongside the event so callers can install a
     /// promotion route; iteration order (BTreeMap) is deterministic.
     pub fn parse_any_keyed(&mut self, raw: &str) -> Option<(String, NetworkActivity)> {
-        let now = self.tick();
+        let mut winner: Option<(String, NetworkActivity)> = None;
         for (key, entry) in self.parsers.iter_mut() {
-            if let (true, Some(re)) = (entry.regex.is_some(), entry.regex.as_ref()) {
+            if let Some(re) = entry.regex.as_ref() {
                 if let Ok(activity) = entry.parser.parse_with_regex(re, raw) {
-                    entry.last_use = now;
-                    return Some((key.clone(), activity));
+                    winner = Some((key.clone(), activity));
+                    break;
                 }
             }
         }
-        None
+        // Stamp LRU only on a real hit (see `parse_key`).
+        let (key, activity) = winner?;
+        let now = self.tick();
+        if let Some(entry) = self.parsers.get_mut(&key) {
+            entry.last_use = now;
+        }
+        Some((key, activity))
     }
 
     /// Attempt to parse a log line with any registered dynamic parser
@@ -894,6 +949,18 @@ fn protocol_name_from_num(num: u8) -> &'static str {
 
 fn sanitize_ident(s: &str) -> String {
     s.chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+/// Parse a log-captured address into an `IpAddr`, accepting both IPv4 and IPv6.
+///
+/// Strips an RFC 4007 zone id (`fe80::1%eth0`) before parsing: the synthesized
+/// patterns admit `%` so link-local samples capture cleanly, but
+/// `IpAddr::from_str` does not accept a scoped address. Returns `None` for
+/// anything that is not a valid address.
+fn parse_ip(raw: &str) -> Option<IpAddr> {
+    let trimmed = raw.trim();
+    let unscoped = trimmed.split_once('%').map_or(trimmed, |(addr, _)| addr);
+    IpAddr::from_str(unscoped).ok()
 }
 
 #[cfg(test)]
@@ -964,8 +1031,9 @@ mod tests {
         assert_eq!(report.match_percentage, 100.0);
     }
 
-    /// Compiled regex is cached via Arc<OnceLock<Regex>> — repeated parse()
-    /// calls must NOT recompile (pointer equality proves cache hit).
+    /// Compiled regex is cached via Arc<OnceLock<Option<Regex>>> — repeated
+    /// parse() calls must NOT recompile, and a Clone must share the same cell.
+    /// Asserted with Arc::ptr_eq on the cache itself, not just on results.
     #[test]
     fn test_parse_caches_compiled_regex() {
         let parser = ParserDefinition {
@@ -983,10 +1051,28 @@ mod tests {
         let ev2 = parser.parse("src=10.0.0.3 dst=10.0.0.4").unwrap();
         assert_eq!(ev1.src_endpoint.ip.as_deref(), Some("10.0.0.1"));
         assert_eq!(ev2.src_endpoint.ip.as_deref(), Some("10.0.0.3"));
-        // Clone shares the same Arc<OnceLock<Regex>> — no recompile on clone path.
+        assert!(
+            parser.regex_cache.get().is_some(),
+            "cache must be initialized after the first parse"
+        );
+
+        // Clone must SHARE the exact same cache cell (no second compile).
         let cloned = parser.clone();
+        assert!(
+            Arc::ptr_eq(&parser.regex_cache, &cloned.regex_cache),
+            "Clone must share the compiled-regex cache, not allocate a new one"
+        );
+        // The shared cell is already warm, so this must not recompile.
         let ev3 = cloned.parse("src=10.0.0.5 dst=10.0.0.6").unwrap();
         assert_eq!(ev3.src_endpoint.ip.as_deref(), Some("10.0.0.5"));
+
+        // Still exactly one cache cell populated — a recompile would have
+        // produced a second Regex behind the same key.
+        let cached = parser.regex_cache.get().and_then(|r| r.as_ref()).unwrap();
+        assert!(
+            cached.is_match("src=10.0.0.9 dst=10.0.0.8"),
+            "the cached Regex must be the live one used by parse()"
+        );
     }
 
     /// A pattern that fails to compile must return Err, never panic —
@@ -1147,24 +1233,133 @@ mod tests {
             report.errors
         );
         assert!((report.match_percentage - 95.0).abs() < 0.01);
+        assert!(
+            !report.errors.is_empty(),
+            "the failed sample must surface as a warning, not vanish"
+        );
+        assert_eq!(report.matched_samples, 19);
+        assert_eq!(report.total_samples, 20);
     }
 
     /// confidence_score must reflect the real match percentage, not a hardcoded
-    /// 1.0 — a parser that failed on some samples cannot claim 100% confidence.
+    /// 1.0. Driven with a genuinely PARTIAL run (19/20 = 0.95) so the assertion
+    /// fails against the old `confidence_score: 1.0`.
     #[test]
     fn test_confidence_score_reflects_match_percentage() {
-        let good = vec![
-            r#"date=2026-09-21 srcip=10.1.1.1 dstip=10.2.2.2 proto=6 action=pass"#,
-            r#"date=2026-09-21 srcip=10.1.1.2 dstip=10.2.2.3 proto=6 action=pass"#,
-            r#"date=2026-09-21 srcip=10.1.1.3 dstip=10.2.2.4 proto=6 action=pass"#,
-        ];
-        let (def, report) = Onboarder::generate_parser("v", "m", &good).unwrap();
+        let mut owned: Vec<String> = (0..19)
+            .map(|i| format!("srcip=10.1.1.{i} dstip=10.2.2.2 action=pass"))
+            .collect();
+        owned.push("garbage that will not match".to_string());
+        let samples: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+
+        let (def, report) = Onboarder::generate_parser("v", "m", &samples).unwrap();
+        assert_eq!(report.match_percentage, 95.0);
         assert!(
-            (def.confidence_score - report.match_percentage / 100.0).abs() < 1e-9,
-            "confidence must equal match_percentage/100: {} vs {}",
-            def.confidence_score,
-            report.match_percentage / 100.0
+            (def.confidence_score - 0.95).abs() < 1e-9,
+            "confidence must be 0.95 for a 95% run, not 1.0: got {}",
+            def.confidence_score
         );
+    }
+
+    /// Below 20 samples the gate stays STRICT: at N=3 a single failure is 33%,
+    /// which is not a 95% rule. `max(1)` used to pass it.
+    #[test]
+    fn test_threshold_strict_below_20_samples() {
+        let parser = ParserDefinition {
+            vendor: "test".into(),
+            device_model: "small".into(),
+            regex_pattern: r"^srcip=(?P<src_ip>\S+) dstip=(?P<dst_ip>\S+)$".to_string(),
+            action_mappings: HashMap::new(),
+            sample_logs: vec![],
+            confidence_score: 1.0,
+            created_at: 0,
+            regex_cache: Arc::new(OnceLock::new()),
+        };
+        // 2 of 3 match = 66.7% — must FAIL below the relaxation floor.
+        let samples = [
+            "srcip=10.0.0.1 dstip=10.0.0.2",
+            "srcip=10.0.0.3 dstip=10.0.0.4",
+            "total garbage that cannot match",
+        ];
+        let report = Onboarder::validate_parser(&parser, &samples).unwrap();
+        assert!(
+            !report.passed,
+            "66.7% must not pass below 20 samples: {:?}",
+            report.errors
+        );
+    }
+
+    /// A dead entry (uncompilable pattern) must not pin itself as
+    /// most-recently-used and squat a capacity slot forever.
+    #[test]
+    fn test_dead_entry_does_not_pin_lru_slot() {
+        let mut reg = DynamicParserRegistry::new();
+        let dead = ParserDefinition {
+            vendor: "deadvendor".into(),
+            device_model: "broken".into(),
+            regex_pattern: "^(?P<src_ip>[unclosed".to_string(),
+            action_mappings: HashMap::new(),
+            sample_logs: vec![],
+            confidence_score: 1.0,
+            created_at: 0,
+            regex_cache: Arc::new(OnceLock::new()),
+        };
+        assert_eq!(reg.register(dead), "deadvendor:broken");
+        assert_eq!(
+            reg.failed_registrations(),
+            1,
+            "uncompilable pattern must be counted, not silently swallowed"
+        );
+        assert!(
+            reg.parse_key("deadvendor:broken", "anything").is_none(),
+            "dead entry can never parse"
+        );
+        // Fill the registry, then overflow: the dead entry must be evicted
+        // (it was never successfully used) rather than surviving forever.
+        let mk = |m: &str| ParserDefinition {
+            vendor: "v".into(),
+            device_model: m.into(),
+            regex_pattern: r"^line (?P<src_port>\d+)$".to_string(),
+            action_mappings: HashMap::new(),
+            sample_logs: vec![],
+            confidence_score: 1.0,
+            created_at: 0,
+            regex_cache: Arc::new(OnceLock::new()),
+        };
+        for i in 0..REGISTRY_CAPACITY {
+            let _ = reg.register(mk(&format!("m-{i:04}")));
+        }
+        // Touch the last live entry so it is NOT the eviction victim.
+        let last = format!("v:m-{:04}", REGISTRY_CAPACITY - 1);
+        assert!(reg.parse_key(&last, "line 443").is_some());
+        let _ = reg.register(mk("overflow"));
+        assert_eq!(reg.len(), REGISTRY_CAPACITY, "bound must hold");
+        assert!(
+            !reg.parsers.contains_key("deadvendor:broken"),
+            "a never-parsing entry must age out under LRU pressure, not pin a slot"
+        );
+    }
+
+    /// Positional synthesis must capture ports that appear in their own
+    /// columns — the loose IP class also matches digits, so branch order matters.
+    #[test]
+    fn test_positional_synthesizer_standalone_port_columns() {
+        let samples = vec![
+            "edge 10.0.0.1 10.0.0.2 443 22 TCP accept",
+            "edge 10.0.0.3 10.0.0.4 444 23 TCP accept",
+            "edge 10.0.0.5 10.0.0.6 445 24 TCP accept",
+        ];
+        let pattern = Onboarder::synthesize_regex(&samples).unwrap();
+        let re = Regex::new(&pattern).unwrap();
+        let caps = re.captures(samples[0]).unwrap();
+        assert_eq!(caps.name("src_ip").map(|m| m.as_str()), Some("10.0.0.1"));
+        assert_eq!(caps.name("dst_ip").map(|m| m.as_str()), Some("10.0.0.2"));
+        assert_eq!(
+            caps.name("src_port").map(|m| m.as_str()),
+            Some("443"),
+            "standalone port column must be captured, not swallowed by the IP branch"
+        );
+        assert_eq!(caps.name("dst_port").map(|m| m.as_str()), Some("22"));
     }
 
     /// Registry is bounded (REGISTRY_CAPACITY) with LRU-by-last-use eviction and
