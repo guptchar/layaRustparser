@@ -565,6 +565,16 @@ impl Onboarder {
     fn synthesize_regex(samples: &[&str]) -> Result<String> {
         let first = samples[0];
 
+        // Case 0: ArcSight CEF — checked FIRST, before the flow-arrow branch.
+        // A CEF extension block can legally contain `->` or the word
+        // `session`, either of which would route the sample into
+        // `synthesize_flow_regex` and build a pattern around the wrong
+        // anchor (the KV branch would also misfire on `src=` while missing
+        // the CEF-short `spt=`/`dpt=` port keys entirely).
+        if first.contains("CEF:") {
+            return Self::synthesize_cef_regex(samples);
+        }
+
         // Case 1: Check for Juniper SRX / Directional Flow format: `IP/PORT->IP/PORT` or `IP:PORT -> IP:PORT`
         if first.contains("->")
             || first.contains("session created")
@@ -580,6 +590,100 @@ impl Onboarder {
 
         // Case 3: Token Positional / Freeform format
         Self::synthesize_positional_regex(samples)
+    }
+
+    /// Synthesize regex for ArcSight CEF (`CEF:v|vendor|product|version|sig|name|sev|ext`).
+    ///
+    /// Over-match guards (a CEF pattern must never fire on other vendors'
+    /// traffic — see the cross-vendor sweep test):
+    /// - the `CEF:\d+|` header anchor is mandatory, not optional;
+    /// - every extension key is prefixed with `\b` (`src=` must not match
+    ///   inside `srcintf=` or `srcip=`);
+    /// - `act=` is a mandatory clause whenever sample 1 carries it, and
+    ///   `src=`/`dst=` are always mandatory — without endpoints the sandbox
+    ///   validator rejects the pattern anyway, so fail loudly here instead.
+    ///
+    /// The action group reuses the `action` capture name so
+    /// `parse_with_regex` maps it with no runtime change.
+    fn synthesize_cef_regex(samples: &[&str]) -> Result<String> {
+        let first = samples[0];
+
+        // CEF-short extension keys in first-sample offset order. The KV
+        // branch only knows `sport=`/`srcport=`/`dport=` and misses `spt=`
+        // and `dpt=` entirely — which is why CEF gets its own synthesizer.
+        let key_patterns = vec![
+            (
+                "action",
+                static_re(r"\bact=")?,
+                // CEF verbs carry hyphens (`client-rst`); tolerate the
+                // quoted FortiGate form the same way the KV branch does.
+                r#"(?:act)="?(?P<action>[a-zA-Z0-9_-]+)"?"#,
+            ),
+            (
+                "src_ip",
+                static_re(r"\bsrc=")?,
+                r"(?:src)=(?P<src_ip>[0-9a-fA-F.:%]+)",
+            ),
+            (
+                "src_port",
+                static_re(r"\bspt=")?,
+                r"(?:spt)=(?P<src_port>\d{1,5})",
+            ),
+            (
+                "dst_ip",
+                static_re(r"\bdst=")?,
+                r"(?:dst)=(?P<dst_ip>[0-9a-fA-F.:%]+)",
+            ),
+            (
+                "dst_port",
+                static_re(r"\bdpt=")?,
+                r"(?:dpt)=(?P<dst_port>\d{1,5})",
+            ),
+            (
+                "protocol",
+                static_re(r"\bproto=")?,
+                r"(?:proto)=(?P<protocol>[a-zA-Z0-9]+)",
+            ),
+        ];
+
+        let mut ordered_patterns: Vec<(usize, &str, &str)> = Vec::new();
+        for (name, re, capture_pat) in &key_patterns {
+            if let Some(m) = re.find(first) {
+                ordered_patterns.push((m.start(), name, capture_pat));
+            }
+        }
+        ordered_patterns.sort_by_key(|k| k.0);
+
+        // Endpoints are non-negotiable: a pattern without `src_ip`/`dst_ip`
+        // captures can never pass the sandbox validator, so say so now with
+        // the sample attached instead of failing validation opaquely later.
+        for required in ["src_ip", "dst_ip"] {
+            if !ordered_patterns.iter().any(|(_, n, _)| *n == required) {
+                return Err(anyhow!(
+                    "No CEF endpoint key for '{required}' in sample: '{first}'"
+                ));
+            }
+        }
+        if ordered_patterns.is_empty() {
+            return Err(anyhow!(
+                "No recognizable CEF extension keys found in sample"
+            ));
+        }
+
+        // Seven `|`-separated header fields; `[^|]*` per field so an empty
+        // field (or a `dvchost` tail) never breaks the anchor. Header names
+        // are `cef_`-prefixed: unknown to `parse_with_regex`, so they land
+        // in `unmapped` as provenance instead of colliding with endpoints.
+        let mut regex_str = String::from(
+            r"^.*?CEF:(?P<cef_version>\d+)\|(?P<cef_vendor>[^|]*)\|(?P<cef_product>[^|]*)\|(?P<cef_device_version>[^|]*)\|(?P<cef_sig_id>[^|]*)\|(?P<cef_name>[^|]*)\|(?P<cef_severity>[^|]*)\|",
+        );
+        for (_, _, pat) in ordered_patterns {
+            regex_str.push_str(r".*?\b");
+            regex_str.push_str(pat);
+        }
+        regex_str.push_str(".*$");
+
+        Ok(regex_str)
     }
 
     /// Synthesize regex for directional arrow flow formats (e.g. Juniper SRX `IP/PORT->IP/PORT`)
@@ -945,6 +1049,16 @@ impl Onboarder {
         map.insert("reject".to_string(), disposition::BLOCKED.to_string());
         map.insert("drop".to_string(), disposition::DROPPED.to_string());
         map.insert("dropped".to_string(), disposition::DROPPED.to_string());
+        // CEF verbs, mirroring the native CEF extractor's disposition
+        // vocabulary (`cef.rs`): without these a synthesized CEF parser maps
+        // `act=timeout`/`client-rst`/`server-rst`/`close` to UNKNOWN while the
+        // native route reports ALLOWED/CLOSE for the same line.
+        map.insert("allowed".to_string(), disposition::ALLOWED.to_string());
+        map.insert("close".to_string(), disposition::ALLOWED.to_string());
+        map.insert("timeout".to_string(), disposition::ALLOWED.to_string());
+        map.insert("client-rst".to_string(), disposition::ALLOWED.to_string());
+        map.insert("server-rst".to_string(), disposition::ALLOWED.to_string());
+        map.insert("reset".to_string(), disposition::ALLOWED.to_string());
         map
     }
 }
