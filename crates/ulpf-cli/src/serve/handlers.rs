@@ -827,7 +827,20 @@ pub async fn post_onboard(
         )
     })?;
 
-    let _ = std::fs::write(&yaml_path, yaml_str);
+    // A silently-dropped YAML write returns 201 claiming the parser hit disk
+    // while data/parsers/*.yaml stays missing — check it like the JSON write.
+    std::fs::write(&yaml_path, yaml_str).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Disk Write Error".to_string(),
+                code: 500,
+                message: format!("Failed writing parser YAML to disk: {}", e),
+                block_id: None,
+                leaf_index: None,
+            }),
+        )
+    })?;
 
     // Hot-load into active registry
     {

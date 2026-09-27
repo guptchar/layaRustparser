@@ -1054,6 +1054,14 @@ fn run_onboard(args: OnboardArgs) -> Result<()> {
         "  Validation Pass Rate: \x1b[1;32m{:.1}%\x1b[0m ({} of {} samples passed)",
         report.match_percentage, report.matched_samples, report.total_samples
     );
+    // Surface partial-validation warnings — a knowingly-imperfect parser must
+    // never persist silently (the 95% threshold makes this reachable).
+    if !report.errors.is_empty() {
+        println!("  \x1b[1;33mWarnings ({}):\x1b[0m", report.errors.len());
+        for err in &report.errors {
+            println!("    \x1b[1;33m!\x1b[0m {err}");
+        }
+    }
     println!(
         "  Synthesized Regex   : \x1b[1;33m{}\x1b[0m",
         parser_def.regex_pattern
