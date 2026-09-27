@@ -575,6 +575,18 @@ impl Onboarder {
             return Self::synthesize_cef_regex(samples);
         }
 
+        // Case 0b: JSON / Suricata EVE — a trimmed leading `{` is unambiguous
+        // (no other branch handles it; today these fall through to the
+        // positional tokenizer, which shreds them on whitespace). Tried
+        // before the flow-arrow branch: an EVE `signature` string can legally
+        // contain `->`. A sample that merely starts with `{` but is not valid
+        // JSON falls through to the branches below.
+        if first.trim_start().starts_with('{') {
+            if let Ok(pattern) = Self::synthesize_json_regex(samples) {
+                return Ok(pattern);
+            }
+        }
+
         // Case 1: Check for Juniper SRX / Directional Flow format: `IP/PORT->IP/PORT` or `IP:PORT -> IP:PORT`
         if first.contains("->")
             || first.contains("session created")
@@ -684,6 +696,173 @@ impl Onboarder {
         regex_str.push_str(".*$");
 
         Ok(regex_str)
+    }
+
+    /// Synthesize regex for JSON log lines (Suricata EVE-JSON shape).
+    ///
+    /// Option A: parse the samples with `serde_json` (already a direct
+    /// dependency — nothing new), flatten each document to key paths, and
+    /// emit ONE regex anchored at `^\s*\{` whose clauses are
+    /// `regex::escape`'d literal keys joined by `.*?`. There is deliberately
+    /// NO hand-regexed JSON grammar here: quoting, nesting, and key order
+    /// are handled by matching literal keys, not by parsing JSON with regex.
+    ///
+    /// Clause order follows the keys' offsets in the first sample's raw text
+    /// (`serde_json::Map` is alphabetically ordered without `preserve_order`,
+    /// so document order is read off the raw string, KV-branch style). A key
+    /// path present in EVERY sample becomes a mandatory clause; a path seen
+    /// only in some (e.g. `alert.action`, absent from EVE `flow`/`dns`
+    /// records) becomes `(?:...)?` — otherwise a mixed-type training set
+    /// could never validate. The value class follows the observed JSON type:
+    /// strings match quoted, numbers bare, mixed either.
+    fn synthesize_json_regex(samples: &[&str]) -> Result<String> {
+        let first = samples[0];
+        let first_val: serde_json::Value = serde_json::from_str(first)
+            .with_context(|| "First sample is not valid JSON".to_string())?;
+
+        // All samples must be JSON documents; a non-JSON sample means this
+        // branch was mis-dispatched (caller falls through on our Err).
+        let mut parsed: Vec<serde_json::Value> = Vec::with_capacity(samples.len());
+        for s in samples {
+            parsed.push(
+                serde_json::from_str(s)
+                    .with_context(|| "JSON synthesizer requires all samples to be JSON")?,
+            );
+        }
+
+        // Flatten the first document to scalar key paths (objects only;
+        // arrays carry no endpoint material and are skipped).
+        let mut leaves: Vec<Vec<String>> = Vec::new();
+        Self::flatten_json_leaves(&first_val, &mut Vec::new(), &mut leaves);
+
+        // Keep only leaves that alias to a canonical endpoint/action name,
+        // in first-sample raw-text offset order.
+        let mut ordered: Vec<(usize, Vec<String>, &'static str)> = Vec::new();
+        for path in &leaves {
+            let leaf = &path[path.len() - 1];
+            if let Some(canonical) = json_alias(leaf) {
+                // Offset of the leaf key's quoted literal in the raw sample.
+                let needle = format!("\"{leaf}\"");
+                if let Some(off) = first.find(&needle) {
+                    ordered.push((off, path.clone(), canonical));
+                }
+            }
+        }
+        ordered.sort_by_key(|k| k.0);
+        if ordered.is_empty() {
+            return Err(anyhow!("No endpoint/action keys found in JSON sample"));
+        }
+
+        // Unique capture names under the same budget rule as the positional
+        // synthesizer: the first claimant takes the canonical name, a repeat
+        // (e.g. top-level `action` plus nested `alert.action`) takes the
+        // `parent_canonical` suffix, a third degrades to non-capturing.
+        let mut taken: HashSet<String> = HashSet::new();
+        let mut resolve_name = |canonical: &'static str, parent: Option<&str>| -> Option<String> {
+            if taken.insert(canonical.to_string()) {
+                return Some(canonical.to_string());
+            }
+            if let Some(p) = parent {
+                let clean: String = p.chars().filter(|c| c.is_alphanumeric()).collect();
+                let suffixed = format!("{clean}_{canonical}");
+                if taken.insert(suffixed.clone()) {
+                    return Some(suffixed);
+                }
+            }
+            None
+        };
+
+        let mut regex_str = String::from(r"^\s*\{");
+        for (_, path, canonical) in ordered {
+            let leaf = &path[path.len() - 1];
+            let parent = if path.len() > 1 {
+                Some(path[path.len() - 2].as_str())
+            } else {
+                None
+            };
+
+            // Presence + value class across ALL samples: unanimous paths are
+            // mandatory clauses, partial paths `(?:...)?` — a mixed-type
+            // training set (alert/flow/dns) could never validate otherwise.
+            let mut present = 0;
+            let mut saw_str = false;
+            let mut saw_num = false;
+            for v in &parsed {
+                if let Some((is_str, is_num)) = json_path_scalar(v, &path) {
+                    present += 1;
+                    saw_str |= is_str;
+                    saw_num |= is_num;
+                }
+            }
+            if present == 0 {
+                continue;
+            }
+            let mandatory = present == parsed.len();
+
+            let value_pat = match canonical {
+                "src_ip" | "dst_ip" => r#"[^"]+"#,
+                "src_port" | "dst_port" => r"\d{1,5}",
+                "protocol" => r"[A-Za-z0-9]+",
+                _ => r"[A-Za-z0-9_-]+", // action
+            };
+            let key_lit = regex::escape(leaf);
+            let inner = match resolve_name(canonical, parent) {
+                Some(name) => format!("(?P<{name}>{value_pat})"),
+                None => format!("(?:{value_pat})"),
+            };
+            let clause = if saw_str && !saw_num {
+                format!(r#""{key_lit}"\s*:\s*"{inner}""#)
+            } else if saw_num && !saw_str {
+                // Numeric endpoints are bare in EVE (`"src_port": 56529`).
+                format!(r#""{key_lit}"\s*:\s*{inner}"#)
+            } else {
+                format!(r#""{key_lit}"\s*:\s*"?{inner}"?"#)
+            };
+            // A nested path (`alert.action`) scopes the leaf inside its
+            // parent object; `[^}]*?` (not `.*?`) keeps the join from
+            // spilling past the parent's closing brace.
+            let scoped = if let Some(p) = parent {
+                let parent_lit = regex::escape(p);
+                format!(r#""{parent_lit}"\s*:\s*\{{[^}}]*?{clause}"#)
+            } else {
+                clause
+            };
+            if mandatory {
+                regex_str.push_str(".*?");
+                regex_str.push_str(&scoped);
+            } else {
+                regex_str.push_str("(?:.*?");
+                regex_str.push_str(&scoped);
+                regex_str.push_str(")?");
+            }
+        }
+        regex_str.push_str(".*$");
+
+        // The pattern must actually compile — `resolve_name` keeps names
+        // unique, but prove it here rather than at validation time.
+        static_re(&regex_str)?;
+        Ok(regex_str)
+    }
+
+    /// Recursively collect scalar (string/number) key paths of a JSON
+    /// document. Objects are descended; arrays, bools, and nulls are skipped
+    /// — none of them alias to an endpoint or action capture.
+    fn flatten_json_leaves(
+        value: &serde_json::Value,
+        prefix: &mut Vec<String>,
+        out: &mut Vec<Vec<String>>,
+    ) {
+        if let Some(obj) = value.as_object() {
+            for (k, v) in obj {
+                prefix.push(k.clone());
+                if v.is_string() || v.is_number() {
+                    out.push(prefix.clone());
+                } else if v.is_object() {
+                    Self::flatten_json_leaves(v, prefix, out);
+                }
+                prefix.pop();
+            }
+        }
     }
 
     /// Synthesize regex for directional arrow flow formats (e.g. Juniper SRX `IP/PORT->IP/PORT`)
@@ -1248,6 +1427,41 @@ impl DynamicParserRegistry {
 impl Default for DynamicParserRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Alias a JSON leaf key to its canonical capture name.
+///
+/// Covers Suricata EVE spellings (`src_ip`, `dest_ip`, `dest_port`) and the
+/// short forms other JSON emitters use (`srcip`, `dstip`, `dport`, `act`).
+/// Anything unlisted returns `None` and is left out of the pattern.
+fn json_alias(leaf: &str) -> Option<&'static str> {
+    match leaf.to_ascii_lowercase().as_str() {
+        "src_ip" | "srcip" | "source_ip" | "src" => Some("src_ip"),
+        "dest_ip" | "dstip" | "dest" | "dst_ip" | "dst" => Some("dst_ip"),
+        "src_port" | "sport" | "source_port" => Some("src_port"),
+        "dest_port" | "dport" | "destport" | "dst_port" | "dstport" => Some("dst_port"),
+        "proto" | "protocol" | "transport" => Some("protocol"),
+        "action" | "act" => Some("action"),
+        _ => None,
+    }
+}
+
+/// Look up a key path in a JSON document. Returns `Some((is_str, is_num))`
+/// for scalar string/number leaves, `None` when the path is absent (or is
+/// not a scalar — a type change across samples counts as absent, so the
+/// clause degrades to optional rather than trusting one shape).
+fn json_path_scalar(value: &serde_json::Value, path: &[String]) -> Option<(bool, bool)> {
+    let mut cur = value;
+    for seg in path {
+        cur = cur.as_object()?.get(seg)?;
+    }
+    if cur.is_string() {
+        Some((true, false))
+    } else if cur.is_number() {
+        Some((false, true))
+    } else {
+        None
     }
 }
 
