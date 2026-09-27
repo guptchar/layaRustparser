@@ -133,6 +133,14 @@ impl ParserDefinition {
         // group captures `14:00` or any other non-address must fail the event,
         // not file it under a garbage IP: bare IPv6 (`2001:db8::1`) passes
         // intact, anything unparseable is an Err like a validation miss.
+        // `Endpoint` has no hostname field, so a non-address was never a valid
+        // value here — accepting one was silently corrupting the store.
+        //
+        // Cost: measured ~250 ns/event in release (two `IpAddr::from_str`) on
+        // a ~1.2 us call, i.e. the novel-vendor dynamic route. Only unknown
+        // shapes reach this path, and it buys a guarantee that no event is
+        // ever filed under a fabricated address. Revisit only alongside a
+        // cheaper address check, never by dropping the check.
         let src_ip_raw = caps.name("src_ip").map(|m| m.as_str());
         if let Some(s) = src_ip_raw {
             if parse_ip(s).is_none() {
