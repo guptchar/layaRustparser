@@ -778,33 +778,66 @@ impl Onboarder {
             single: Option<&'static str>,
         }
         let mut assigned = vec![Assigned::default(); min_len];
-        let mut ip_slot = 0usize;
-        let mut port_slot = 0usize;
-        let slots = |slot: &mut usize, table: &[&'static str]| -> Option<&'static str> {
-            let name = table.get(*slot).copied();
-            if name.is_some() {
-                *slot += 1;
-            }
-            name
-        };
         const IP_SLOTS: [&str; 2] = ["src_ip", "dst_ip"];
         const PORT_SLOTS: [&str; 2] = ["src_port", "dst_port"];
+        // A "side" is an endpoint: an address, and the port that belongs to it.
+        //
+        // The address cursor and the port cursor are separate, because a bare
+        // `443` column and a bare `10.0.0.1` column are INDEPENDENT evidence
+        // about side 0 and either can appear without the other:
+        //
+        //     443  10.0.0.1  80  10.0.0.2      ->  src=10.0.0.1:443  dst=10.0.0.2:80
+        //
+        // What is not allowed is the two cursors drifting apart on a column that
+        // carries BOTH halves. An `IP:port` column is one complete endpoint, and
+        // its port must be named from the same side as its address. Free-running
+        // cursors let them drift, and the result reports the DESTINATION's port
+        // as the source's:
+        //
+        //     fw  10.0.0.1  10.0.0.2:443
+        //         src_ip     dst_ip : src_port   <- wrong side, silently published
+        //
+        // `port_taken` is what ties them together: a side claimed by an
+        // `IP:port` column is off-limits to a later standalone port, so the
+        // address and the port on one column can never come from different sides.
+        let mut ip_taken = [false; IP_SLOTS.len()];
+        let mut port_taken = [false; PORT_SLOTS.len()];
 
-        // Endpoint columns first.
+        // Endpoint columns first, in column order.
         for (i, kind) in kinds.iter().enumerate() {
-            match kind {
-                Col::IpPort(_) => {
-                    assigned[i].ip = slots(&mut ip_slot, &IP_SLOTS);
-                    assigned[i].port = slots(&mut port_slot, &PORT_SLOTS);
+            let complete = matches!(kind, Col::IpPort(_));
+            if !complete && !matches!(kind, Col::Ip) {
+                continue;
+            }
+            let Some(side) = (0..IP_SLOTS.len()).find(|s| !ip_taken[*s]) else {
+                // No side left, so a complete endpoint yields NEITHER name. A
+                // port bound to an address that was not captured is a port on
+                // the wrong endpoint, which is the bug this pass exists to stop.
+                continue;
+            };
+            ip_taken[side] = true;
+            assigned[i].ip = Some(IP_SLOTS[side]);
+            if complete {
+                // Unreachable while the standalone pass runs second; guarded
+                // anyway, because a reordering would hand `src_port` out twice
+                // and duplicate names make the whole pattern uncompilable.
+                if !port_taken[side] {
+                    port_taken[side] = true;
+                    assigned[i].port = Some(PORT_SLOTS[side]);
                 }
-                Col::Ip => assigned[i].ip = slots(&mut ip_slot, &IP_SLOTS),
-                _ => {}
             }
         }
-        // Then standalone port columns, with whatever the endpoints left.
+        // Then standalone port columns, into whatever port sides the endpoints
+        // left. A port that cannot be named stays uncaptured — a field that is
+        // not extracted, which is honest, rather than one bound to the wrong
+        // column.
         for (i, kind) in kinds.iter().enumerate() {
-            if matches!(kind, Col::Port) {
-                assigned[i].port = slots(&mut port_slot, &PORT_SLOTS);
+            if !matches!(kind, Col::Port) {
+                continue;
+            }
+            if let Some(side) = (0..PORT_SLOTS.len()).find(|s| !port_taken[*s]) {
+                port_taken[side] = true;
+                assigned[i].port = Some(PORT_SLOTS[side]);
             }
         }
         // Cosmetic singletons: a repeat is downgraded silently. Missing a
@@ -1321,6 +1354,78 @@ mod tests {
         let got = |n: &str| caps.name(n).map(|m| m.as_str().to_string());
         assert_eq!(got("src_port").as_deref(), Some("1000"));
         assert_eq!(got("dst_port").as_deref(), Some("2000"));
+    }
+
+    /// The address and the port on ONE column must come from the same side.
+    ///
+    /// A sibling of the test above, one level deeper. Fixing that one required
+    /// independent ip/port cursors, and two independent cursors can drift: a
+    /// bare `10.0.0.1` column claims address-side 0 while a later
+    /// `10.0.0.2:443` column reads port-side 0, so the DESTINATION's port is
+    /// recorded as the source's. It compiles, `validate_parser` accepts it (443
+    /// is a valid u16), and it publishes at confidence 1.0:
+    ///
+    ///     fw  10.0.0.1  10.0.0.2:443
+    ///         src_ip     dst_ip : src_port   <- 443 is the destination's
+    ///
+    /// An `IP:port` column is one complete endpoint, so both of its names are
+    /// taken from a single side index. The cursors stay separate — a bare
+    /// `443` and a bare `10.0.0.1` are independent evidence and either can
+    /// appear alone — but a side claimed by an `IP:port` column is off-limits
+    /// to a later standalone port, which is what stops the drift.
+    #[test]
+    fn test_positional_addr_port_column_takes_both_names_from_one_side() {
+        // (1) An `IP` column takes address-side 0; the `IP:port` column that
+        //     follows must take address-side 1 AND port-side 1.
+        let samples = vec![
+            "fw 10.0.0.1 10.0.0.2:443 TCP accept",
+            "fw 10.0.0.3 10.0.0.4:444 TCP accept",
+            "fw 10.0.0.5 10.0.0.6:445 TCP accept",
+        ];
+        let pattern = Onboarder::synthesize_regex(&samples).unwrap();
+        let re = Regex::new(&pattern).unwrap();
+        let caps = re.captures(samples[0]).unwrap();
+        let got = |n: &str| caps.name(n).map(|m| m.as_str().to_string());
+
+        assert_eq!(got("src_ip").as_deref(), Some("10.0.0.1"));
+        assert_eq!(got("dst_ip").as_deref(), Some("10.0.0.2"));
+        assert_eq!(
+            got("dst_port").as_deref(),
+            Some("443"),
+            "443 is the destination's port: {pattern}"
+        );
+        assert_eq!(
+            got("src_port"),
+            None,
+            "the source column has no port, so src_port must be absent rather \
+             than hold the destination's: {pattern}"
+        );
+
+        // (2) No address side left: the `IP:port` column yields NEITHER name.
+        // A port bound to an uncaptured address is a port on an endpoint that
+        // was never identified, which is the same wrong fact in a new place.
+        let samples = vec![
+            "10.0.0.1 10.0.0.2 10.0.0.3:443 TCP accept",
+            "10.0.0.4 10.0.0.5 10.0.0.6:444 TCP accept",
+            "10.0.0.7 10.0.0.8 10.0.0.9:445 TCP accept",
+        ];
+        let pattern = Onboarder::synthesize_regex(&samples).unwrap();
+        let re = Regex::new(&pattern).unwrap();
+        let caps = re.captures(samples[0]).unwrap();
+        let got = |n: &str| caps.name(n).map(|m| m.as_str().to_string());
+
+        assert_eq!(got("src_ip").as_deref(), Some("10.0.0.1"));
+        assert_eq!(got("dst_ip").as_deref(), Some("10.0.0.2"));
+        assert_eq!(
+            got("src_port"),
+            None,
+            "the third column has no address side, so it gets no port name: {pattern}"
+        );
+        assert_eq!(
+            got("dst_port"),
+            None,
+            "the third column has no address side, so it gets no port name: {pattern}"
+        );
     }
 
     /// A standalone port column still fills a slot when nothing else wants it.
