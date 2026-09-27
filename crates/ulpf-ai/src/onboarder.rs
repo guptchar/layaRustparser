@@ -2638,4 +2638,145 @@ mod tests {
         assert!(reg.parse("vendor", "line 443").is_ok());
         assert_eq!(reg.len(), REGISTRY_CAPACITY);
     }
+
+    /// New definitions stamp [`PARSER_SCHEMA_VERSION`]; files published before
+    /// the field existed (no `schema_version` key at all) still load — as
+    /// version 0 — instead of failing `from_yaml`'s missing-field rejection.
+    #[test]
+    fn test_schema_version_roundtrip_and_legacy_default() {
+        let parser = ParserDefinition {
+            vendor: "v".into(),
+            device_model: "m".into(),
+            regex_pattern: r"^src=(?P<src_ip>\S+) dst=(?P<dst_ip>\S+)$".to_string(),
+            action_mappings: HashMap::new(),
+            sample_logs: vec![],
+            confidence_score: 1.0,
+            created_at: 0,
+            schema_version: PARSER_SCHEMA_VERSION,
+            regex_cache: Arc::new(OnceLock::new()),
+        };
+        assert_eq!(PARSER_SCHEMA_VERSION, 1);
+        let from_json = ParserDefinition::from_json(&parser.to_json().unwrap()).unwrap();
+        assert_eq!(from_json.schema_version, PARSER_SCHEMA_VERSION);
+        let from_yaml = ParserDefinition::from_yaml(&parser.to_yaml().unwrap()).unwrap();
+        assert_eq!(from_yaml.schema_version, PARSER_SCHEMA_VERSION);
+
+        // A legacy file carries every field EXCEPT schema_version.
+        let legacy_yaml = concat!(
+            "vendor: \"V\"\n",
+            "device_model: \"M\"\n",
+            "confidence_score: 1.00\n",
+            "created_at: 1700000000000\n",
+            "regex_pattern: \"^src=(?P<src_ip>[0-9.]+)$\"\n",
+            "action_mappings: {}\n",
+            "sample_logs:\n",
+            "  - \"src=10.0.0.1\"\n",
+        );
+        let legacy =
+            ParserDefinition::from_yaml(legacy_yaml).expect("legacy file must keep loading");
+        assert_eq!(legacy.schema_version, 0, "absent version defaults to 0");
+        assert_eq!(legacy.vendor, "V");
+
+        let legacy_json = r#"{"vendor":"V","device_model":"M","regex_pattern":"^x$",
+            "action_mappings":{},"sample_logs":[],"confidence_score":1.0,"created_at":0}"#;
+        let legacy_j = ParserDefinition::from_json(legacy_json).unwrap();
+        assert_eq!(legacy_j.schema_version, 0);
+    }
+
+    /// CEF synthesis captures endpoints, CEF-short ports, and the hyphenated
+    /// `act=` verb; dispositions come from the CEF vocabulary, not UNKNOWN.
+    #[test]
+    fn test_cef_synthesizer_captures_endpoints_and_action() {
+        let samples = vec![
+            "CEF:0|Fortinet|FortiGate|v7.0.2|0000000019|traffic:forward accept|3|src=192.168.1.146 spt=25297 dst=203.0.113.207 dpt=80 proto=6 act=accept",
+            "CEF:0|Fortinet|FortiGate|v7.0.2|0000000014|traffic:forward server-rst|3|src=192.168.3.14 spt=46909 dst=198.51.100.3 dpt=993 proto=6 act=server-rst",
+            "CEF:0|Fortinet|FortiGate|v7.0.2|0000000012|traffic:forward deny|3|src=192.168.6.68 spt=46825 dst=198.51.100.142 dpt=123 proto=17 act=deny",
+        ];
+        let pattern = Onboarder::synthesize_regex(&samples).unwrap();
+        assert!(
+            pattern.contains(r"CEF:(?P<cef_version>\d+)\|"),
+            "mandatory header anchor missing: {pattern}"
+        );
+        let re = Regex::new(&pattern).expect("synthesized CEF regex must compile");
+        let caps = re.captures(samples[0]).unwrap();
+        assert_eq!(caps.name("src_ip").unwrap().as_str(), "192.168.1.146");
+        assert_eq!(caps.name("src_port").unwrap().as_str(), "25297");
+        assert_eq!(caps.name("dst_ip").unwrap().as_str(), "203.0.113.207");
+        assert_eq!(caps.name("dst_port").unwrap().as_str(), "80");
+        assert_eq!(caps.name("action").unwrap().as_str(), "accept");
+        let caps2 = re.captures(samples[1]).unwrap();
+        assert_eq!(caps2.name("action").unwrap().as_str(), "server-rst");
+
+        let (def, _) = Onboarder::generate_parser("fortinet", "fgt-cef", &samples).unwrap();
+        let ev = def.parse(samples[0]).unwrap();
+        assert_eq!(ev.src_endpoint.ip.as_deref(), Some("192.168.1.146"));
+        assert_eq!(ev.dst_endpoint.port, Some(80));
+        assert_eq!(ev.disposition, disposition::ALLOWED);
+        let ev_deny = def.parse(samples[2]).unwrap();
+        assert_eq!(ev_deny.disposition, disposition::BLOCKED);
+        // CEF-session verbs map to ALLOWED (never UNKNOWN), like the native extractor.
+        let ev_rst = def.parse(samples[1]).unwrap();
+        assert_eq!(ev_rst.disposition, disposition::ALLOWED);
+    }
+
+    /// CEF dispatch wins over flow-arrow: an extension block containing `->`
+    /// must still synthesize a CEF pattern, not a flow pattern.
+    #[test]
+    fn test_cef_dispatch_first_despite_arrow_in_extension() {
+        let samples = vec![
+            "CEF:0|Fortinet|FortiGate|v7.0.2|0000000019|traffic:forward accept|3|src=192.168.1.146 spt=25297 dst=203.0.113.207 dpt=80 proto=6 act=accept msg=a->b",
+            "CEF:0|Fortinet|FortiGate|v7.0.2|0000000014|traffic:forward accept|3|src=192.168.3.14 spt=46909 dst=198.51.100.3 dpt=993 proto=6 act=accept msg=c->d",
+            "CEF:0|Fortinet|FortiGate|v7.0.2|0000000012|traffic:forward accept|3|src=192.168.6.68 spt=46825 dst=198.51.100.142 dpt=123 proto=17 act=accept msg=e->f",
+        ];
+        let pattern = Onboarder::synthesize_regex(&samples).unwrap();
+        assert!(
+            pattern.contains("CEF:"),
+            "CEF must win dispatch over `->`: {pattern}"
+        );
+        let re = Regex::new(&pattern).unwrap();
+        assert_eq!(
+            re.captures(samples[0])
+                .unwrap()
+                .name("src_ip")
+                .unwrap()
+                .as_str(),
+            "192.168.1.146"
+        );
+    }
+
+    /// JSON synthesis over a MIXED-type training set (alert + flow + dns):
+    /// the 5-tuple is mandatory, `alert.action` is optional, and all three
+    /// shapes validate — under 20 samples the gate is strict (100%).
+    #[test]
+    fn test_json_synthesizer_mixed_eve_types_validate() {
+        let samples = vec![
+            r#"{"timestamp": "2026-09-21T14:00:01.3102+0000", "event_type": "alert", "src_ip": "10.0.0.22", "src_port": 56529, "dest_ip": "198.51.100.188", "dest_port": 1521, "proto": "TCP", "alert": {"action": "blocked", "signature_id": 2000419}}"#,
+            r#"{"timestamp": "2026-09-21T14:00:03.2768+0000", "event_type": "flow", "src_ip": "10.0.0.98", "src_port": 28488, "dest_ip": "203.0.113.74", "dest_port": 8080, "proto": "TCP"}"#,
+            r#"{"timestamp": "2026-09-21T14:00:05.1653+0000", "event_type": "dns", "src_ip": "10.0.0.83", "src_port": 39958, "dest_ip": "9.9.9.9", "dest_port": 53, "proto": "UDP"}"#,
+        ];
+        let pattern = Onboarder::synthesize_regex(&samples).unwrap();
+        assert!(
+            pattern.starts_with(r"^\s*\{"),
+            "JSON pattern must anchor at object start: {pattern}"
+        );
+        let (def, report) = Onboarder::generate_parser("suricata", "eve", &samples).unwrap();
+        assert!(
+            report.passed,
+            "mixed EVE types must validate: {:?}",
+            report.errors
+        );
+
+        let ev_alert = def.parse(samples[0]).unwrap();
+        assert_eq!(ev_alert.src_endpoint.ip.as_deref(), Some("10.0.0.22"));
+        assert_eq!(ev_alert.src_endpoint.port, Some(56529));
+        assert_eq!(ev_alert.dst_endpoint.ip.as_deref(), Some("198.51.100.188"));
+        assert_eq!(ev_alert.dst_endpoint.port, Some(1521));
+        assert_eq!(ev_alert.disposition, disposition::BLOCKED);
+
+        // The flow record has no `alert.action` — it still parses, with an
+        // UNKNOWN disposition rather than a match failure.
+        let ev_flow = def.parse(samples[1]).unwrap();
+        assert_eq!(ev_flow.src_endpoint.ip.as_deref(), Some("10.0.0.98"));
+        assert_eq!(ev_flow.dst_endpoint.port, Some(8080));
+    }
 }
