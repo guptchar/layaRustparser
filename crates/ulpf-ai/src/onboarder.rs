@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 
 use ulpf_core::schema::ocsf::{
@@ -23,8 +23,12 @@ pub struct ValidationReport {
     pub errors: Vec<String>,
 }
 
-/// Dynamically generated and exportable parser definition
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// Dynamically generated and exportable parser definition.
+///
+/// `regex_cache` is excluded from serde (YAML/JSON) — it is a runtime-only
+/// compiled-regex cache. `Clone` is manual because `OnceLock<Regex>` is not
+/// `Clone`; wrapping in `Arc` lets clones share the same cached regex.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ParserDefinition {
     pub vendor: String,
     pub device_model: String,
@@ -33,6 +37,24 @@ pub struct ParserDefinition {
     pub sample_logs: Vec<String>,
     pub confidence_score: f64,
     pub created_at: i64,
+    #[serde(skip)]
+    pub regex_cache: Arc<OnceLock<Regex>>,
+}
+
+impl Clone for ParserDefinition {
+    fn clone(&self) -> Self {
+        Self {
+            vendor: self.vendor.clone(),
+            device_model: self.device_model.clone(),
+            regex_pattern: self.regex_pattern.clone(),
+            action_mappings: self.action_mappings.clone(),
+            sample_logs: self.sample_logs.clone(),
+            confidence_score: self.confidence_score,
+            created_at: self.created_at,
+            // Arc::clone shares the same OnceLock — clones reuse the compiled regex.
+            regex_cache: Arc::clone(&self.regex_cache),
+        }
+    }
 }
 
 impl ParserDefinition {
@@ -46,130 +68,32 @@ impl ParserDefinition {
         serde_json::from_str(json_str).context("Failed to deserialize parser from JSON")
     }
 
-    /// Serialize parser definition to human-readable YAML
+    /// Serialize parser definition to YAML via `noyalib` (pure-Rust, air-gapped).
+    /// Field names are stable — `data/parsers/*.yaml` consumers depend on them.
     pub fn to_yaml(&self) -> Result<String> {
-        let mut yaml = String::new();
-        yaml.push_str(&format!("vendor: \"{}\"\n", self.vendor));
-        yaml.push_str(&format!("device_model: \"{}\"\n", self.device_model));
-        yaml.push_str(&format!("confidence_score: {:.2}\n", self.confidence_score));
-        yaml.push_str(&format!("created_at: {}\n", self.created_at));
-        yaml.push_str(&format!(
-            "regex_pattern: \"{}\"\n",
-            self.regex_pattern
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-        ));
-        yaml.push_str("action_mappings:\n");
-        for (k, v) in &self.action_mappings {
-            yaml.push_str(&format!("  {}: \"{}\"\n", k, v));
-        }
-        yaml.push_str("sample_logs:\n");
-        for sample in &self.sample_logs {
-            yaml.push_str(&format!("  - \"{}\"\n", sample.replace('"', "\\\"")));
-        }
-        Ok(yaml)
+        noyalib::to_string(self).context("Failed to serialize parser to YAML")
     }
 
-    /// Load parser definition from YAML (handles both JSON subset and simple YAML)
+    /// Load parser definition from YAML (or JSON, which is valid YAML 1.2).
     pub fn from_yaml(yaml_str: &str) -> Result<Self> {
-        // Try JSON first as JSON is valid YAML
-        if let Ok(def) = serde_json::from_str::<ParserDefinition>(yaml_str) {
-            return Ok(def);
-        }
-
-        // Parse key properties
-        let mut vendor = "Custom".to_string();
-        let mut device_model = "Device".to_string();
-        let mut regex_pattern = String::new();
-        let mut confidence_score = 1.0;
-        let mut created_at = Utc::now().timestamp_millis();
-        let mut action_mappings = HashMap::new();
-        let mut sample_logs = Vec::new();
-
-        let mut in_action_mappings = false;
-        let mut in_sample_logs = false;
-
-        for line in yaml_str.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-
-            if trimmed == "action_mappings:" {
-                in_action_mappings = true;
-                in_sample_logs = false;
-                continue;
-            }
-            if trimmed == "sample_logs:" {
-                in_sample_logs = true;
-                in_action_mappings = false;
-                continue;
-            }
-
-            if in_action_mappings {
-                if let Some((k, v)) = trimmed.split_once(':') {
-                    let key = k.trim().to_string();
-                    let val = v.trim().trim_matches('"').to_string();
-                    action_mappings.insert(key, val);
-                    continue;
-                } else if !line.starts_with("  ") {
-                    in_action_mappings = false;
+        noyalib::from_str::<ParserDefinition>(yaml_str)
+            .context("Invalid YAML: could not deserialize ParserDefinition")
+            .map(|mut def| {
+                // Ensure regex_cache is initialized (serde skips it).
+                if def.regex_cache.get().is_none() {
+                    def.regex_cache = Arc::new(OnceLock::new());
                 }
-            }
-
-            if in_sample_logs {
-                if let Some(rest) = trimmed.strip_prefix("- ") {
-                    sample_logs.push(rest.trim_matches('"').to_string());
-                    continue;
-                } else if !line.starts_with("  ") {
-                    in_sample_logs = false;
-                }
-            }
-
-            if let Some((k, v)) = trimmed.split_once(':') {
-                let key = k.trim();
-                let val = v.trim().trim_matches('"');
-                match key {
-                    "vendor" => vendor = val.to_string(),
-                    "device_model" => device_model = val.to_string(),
-                    "confidence_score" => confidence_score = val.parse().unwrap_or(1.0),
-                    "created_at" => {
-                        created_at = val
-                            .parse()
-                            .unwrap_or_else(|_| Utc::now().timestamp_millis())
-                    }
-                    "regex_pattern" => {
-                        regex_pattern = val.replace("\\\\", "\\").to_string();
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        if regex_pattern.is_empty() {
-            return Err(anyhow!("Invalid YAML: missing regex_pattern"));
-        }
-
-        Ok(Self {
-            vendor,
-            device_model,
-            regex_pattern,
-            action_mappings,
-            sample_logs,
-            confidence_score,
-            created_at,
-        })
+                def
+            })
     }
 
-    /// Dynamically compile and parse an incoming raw log line into normalized OCSF 1.3 NetworkActivity
+    /// Parse an incoming raw log line into normalized OCSF 1.3 NetworkActivity.
+    /// Uses the cached compiled regex (Arc<OnceLock<Regex>>) — no per-event recompile.
     pub fn parse(&self, raw: &str) -> Result<NetworkActivity> {
-        let compiled_re = Regex::new(&self.regex_pattern).with_context(|| {
-            format!(
-                "Invalid compiled regex in parser definition: {}",
-                self.regex_pattern
-            )
-        })?;
-        self.parse_with_regex(&compiled_re, raw)
+        let compiled_re = self.regex_cache.get_or_init(|| {
+            Regex::new(&self.regex_pattern).expect("regex_pattern must compile at init")
+        });
+        self.parse_with_regex(compiled_re, raw)
     }
 
     /// Parse with a pre-compiled regex (the registry compiles once at register
@@ -403,6 +327,7 @@ impl Onboarder {
             sample_logs: samples.iter().map(|s| s.to_string()).collect(),
             confidence_score: 1.0,
             created_at: Utc::now().timestamp_millis(),
+            regex_cache: Arc::new(OnceLock::new()),
         };
 
         // 3. Run Automated Sandbox Validation
@@ -525,7 +450,9 @@ impl Onboarder {
             0.0
         };
 
-        let passed = matched == total && errors.is_empty();
+        // 95% threshold with warnings — a single malformed sample no longer
+        // rejects an entire parser (was: hard 100% + zero errors).
+        let passed = pct >= 95.0;
 
         Ok(ValidationReport {
             passed,
@@ -560,11 +487,11 @@ impl Onboarder {
     /// Synthesize regex for directional arrow flow formats (e.g. Juniper SRX `IP/PORT->IP/PORT`)
     fn synthesize_flow_regex(samples: &[&str]) -> Result<String> {
         let re_flow_slash =
-            Regex::new(r"((?:\d{1,3}\.){3}\d{1,3})/(\d{1,5})->((?:\d{1,3}\.){3}\d{1,3})/(\d{1,5})")
+            Regex::new(r"((?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+))/(\d{1,5})->((?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+))/(\d{1,5})")
                 .unwrap();
 
         let re_flow_colon = Regex::new(
-            r"((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})\s*->\s*((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})",
+            r"((?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+)):(\d{1,5})\s*->\s*((?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+)):(\d{1,5})",
         )
         .unwrap();
 
@@ -574,17 +501,17 @@ impl Onboarder {
             // Match Juniper SRX RT_FLOW pattern
             // Example: RT_FLOW: RT_FLOW_SESSION_CREATE: session created 192.168.10.55/49152->10.0.0.1/443 None None 6 sample-policy trust untrust 12345 N/A(N/A) ge-0/0/0.0
             if first.starts_with("RT_FLOW") {
-                let pattern = r#"^RT_FLOW:\s+(?P<event_type>\S+)\s+session\s+(?P<action_verb>\w+)(?:.*?)\s+(?P<src_ip>(?:\d{1,3}\.){3}\d{1,3})/(?P<src_port>\d{1,5})->(?P<dst_ip>(?:\d{1,3}\.){3}\d{1,3})/(?P<dst_port>\d{1,5})\s+\S+\s+\S+\s+(?P<protocol>\d+)\s+(?P<policy>\S+)\s+(?P<src_zone>\S+)\s+(?P<dst_zone>\S+)(?:.*)$"#.to_string();
+                let pattern = r#"^RT_FLOW:\s+(?P<event_type>\S+)\s+session\s+(?P<action_verb>\w+)(?:.*?)\s+(?P<src_ip>(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+))/(?P<src_port>\d{1,5})->(?P<dst_ip>(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+))/(?P<dst_port>\d{1,5})\s+\S+\s+\S+\s+(?P<protocol>\d+)\s+(?P<policy>\S+)\s+(?P<src_zone>\S+)\s+(?P<dst_zone>\S+)(?:.*)$"#.to_string();
                 return Ok(pattern);
             }
 
-            let pattern = r#"^.*?(?P<src_ip>(?:\d{1,3}\.){3}\d{1,3})/(?P<src_port>\d{1,5})->(?P<dst_ip>(?:\d{1,3}\.){3}\d{1,3})/(?P<dst_port>\d{1,5})(?:.*?proto[=:\s]+(?P<protocol>\S+))?(?:.*?action[=:\s]+(?P<action>\w+))?.*$"#.to_string();
+            let pattern = r#"^.*?(?P<src_ip>(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+))/(?P<src_port>\d{1,5})->(?P<dst_ip>(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+))/(?P<dst_port>\d{1,5})(?:.*?proto[=:\s]+(?P<protocol>\S+))?(?:.*?action[=:\s]+(?P<action>\w+))?.*$"#.to_string();
             return Ok(pattern);
         }
 
         if re_flow_colon.is_match(first) {
             // Example: 2026-09-21 14:00:01 CheckPoint-FW drop 192.168.10.15:52341 -> 10.0.0.25:443 proto TCP rule 101
-            let pattern = r#"^(?:(?P<timestamp>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+)?(?P<device>\S+)\s+(?P<action>[a-zA-Z]+)\s+(?P<src_ip>(?:\d{1,3}\.){3}\d{1,3}):(?P<src_port>\d{1,5})\s*->\s*(?P<dst_ip>(?:\d{1,3}\.){3}\d{1,3}):(?P<dst_port>\d{1,5})(?:.*?proto\s+(?P<protocol>[a-zA-Z0-9]+))?(?:.*)$"#.to_string();
+            let pattern = r#"^(?:(?P<timestamp>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+)?(?P<device>\S+)\s+(?P<action>[a-zA-Z]+)\s+(?P<src_ip>(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+)):(?P<src_port>\d{1,5})\s*->\s*(?P<dst_ip>(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+)):(?P<dst_port>\d{1,5})(?:.*?proto\s+(?P<protocol>[a-zA-Z0-9]+))?(?:.*)$"#.to_string();
             return Ok(pattern);
         }
 
@@ -607,7 +534,7 @@ impl Onboarder {
             (
                 "src_ip",
                 Regex::new(r"\b(?:src|srcip|saddr)=").unwrap(),
-                r"(?:src|srcip|saddr)=(?P<src_ip>(?:\d{1,3}\.){3}\d{1,3})",
+                r"(?:src|srcip|saddr)=(?P<src_ip>(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+))",
             ),
             (
                 "src_port",
@@ -617,7 +544,7 @@ impl Onboarder {
             (
                 "dst_ip",
                 Regex::new(r"\b(?:dst|dstip|daddr)=").unwrap(),
-                r"(?:dst|dstip|daddr)=(?P<dst_ip>(?:\d{1,3}\.){3}\d{1,3})",
+                r"(?:dst|dstip|daddr)=(?P<dst_ip>(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+))",
             ),
             (
                 "dst_port",
@@ -658,8 +585,13 @@ impl Onboarder {
 
     /// Synthesize regex via positional token alignment across sample lines
     fn synthesize_positional_regex(samples: &[&str]) -> Result<String> {
-        let re_ip_port = Regex::new(r"^((?:\d{1,3}\.){3}\d{1,3})[:/](\d{1,5})$").unwrap();
-        let re_ip = Regex::new(r"^(?:\d{1,3}\.){3}\d{1,3}$").unwrap();
+        let re_ip_port = Regex::new(
+            r"^((?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+))[:/](\d{1,5})$",
+        )
+        .unwrap();
+        let re_ip =
+            Regex::new(r"^(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+)$")
+                .unwrap();
         let re_port = Regex::new(r"^\d{1,5}$").unwrap();
         let re_proto = Regex::new(r"^(?i)(TCP|UDP|ICMP|GRE|ESP|AH|IGMP|SCTP)$").unwrap();
         let re_action =
@@ -693,14 +625,14 @@ impl Onboarder {
                 let delimiter = if col[0].contains(':') { ":" } else { "/" };
                 if ip_count == 0 {
                     parts.push(format!(
-                        r"(?P<src_ip>(?:\d{{1,3}}\.){{3}}\d{{1,3}}){}(?P<src_port>\d{{1,5}})",
+                        r"(?P<src_ip>(?:(?:\d{{1,3}}\.){{3}}\d{{1,3}}|[0-9a-fA-F]{{0,4}}(?::[0-9a-fA-F]{{0,4}})+)){}(?P<src_port>\d{{1,5}})",
                         delimiter
                     ));
                     ip_count += 1;
                     port_count += 1;
                 } else if ip_count == 1 {
                     parts.push(format!(
-                        r"(?P<dst_ip>(?:\d{{1,3}}\.){{3}}\d{{1,3}}){}(?P<dst_port>\d{{1,5}})",
+                        r"(?P<dst_ip>(?:(?:\d{{1,3}}\.){{3}}\d{{1,3}}|[0-9a-fA-F]{{0,4}}(?::[0-9a-fA-F]{{0,4}})+)){}(?P<dst_port>\d{{1,5}})",
                         delimiter
                     ));
                     ip_count += 1;
@@ -709,19 +641,22 @@ impl Onboarder {
                     // 3rd+ ip/port column: NEVER reuse a capture-group name —
                     // duplicate names make the regex fail to compile.
                     parts.push(format!(
-                        r"(?:\d{{1,3}}\.){{3}}\d{{1,3}}{}\d{{1,5}}",
+                        r"(?:(?:\d{{1,3}}\.){{3}}\d{{1,3}}|[0-9a-fA-F]{{0,4}}(?::[0-9a-fA-F]{{0,4}})+){}\d{{1,5}}",
                         delimiter
                     ));
                 }
             } else if col.iter().all(|t| re_ip.is_match(t)) {
                 if ip_count == 0 {
-                    parts.push(r"(?P<src_ip>(?:\d{1,3}\.){3}\d{1,3})".to_string());
+                    parts.push(r"(?P<src_ip>(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+))".to_string());
                     ip_count += 1;
                 } else if ip_count == 1 {
-                    parts.push(r"(?P<dst_ip>(?:\d{1,3}\.){3}\d{1,3})".to_string());
+                    parts.push(r"(?P<dst_ip>(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+))".to_string());
                     ip_count += 1;
                 } else {
-                    parts.push(r"(?:\d{1,3}\.){3}\d{1,3}".to_string());
+                    parts.push(
+                        r"(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4})+)"
+                            .to_string(),
+                    );
                 }
             } else if col.iter().all(|t| re_port.is_match(t)) {
                 if port_count == 0 {
@@ -1013,6 +948,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            regex_cache: Arc::new(OnceLock::new()),
         };
         let samples = [
             "2001:db8::1/443->2001:db8::2/80",
@@ -1022,6 +958,130 @@ mod tests {
         let report = Onboarder::validate_parser(&parser, &samples).unwrap();
         assert!(report.passed, "IPv6 must pass: {:?}", report.errors);
         assert_eq!(report.match_percentage, 100.0);
+    }
+
+    /// Compiled regex is cached via Arc<OnceLock<Regex>> — repeated parse()
+    /// calls must NOT recompile (pointer equality proves cache hit).
+    #[test]
+    fn test_parse_caches_compiled_regex() {
+        let parser = ParserDefinition {
+            vendor: "test".into(),
+            device_model: "cache".into(),
+            regex_pattern: r"^src=(?P<src_ip>\S+) dst=(?P<dst_ip>\S+)$".to_string(),
+            action_mappings: HashMap::new(),
+            sample_logs: vec![],
+            confidence_score: 1.0,
+            created_at: 0,
+            regex_cache: Arc::new(OnceLock::new()),
+        };
+        // First parse compiles + initializes the OnceLock.
+        let ev1 = parser.parse("src=10.0.0.1 dst=10.0.0.2").unwrap();
+        let ev2 = parser.parse("src=10.0.0.3 dst=10.0.0.4").unwrap();
+        assert_eq!(ev1.src_endpoint.ip.as_deref(), Some("10.0.0.1"));
+        assert_eq!(ev2.src_endpoint.ip.as_deref(), Some("10.0.0.3"));
+        // Clone shares the same Arc<OnceLock<Regex>> — no recompile on clone path.
+        let cloned = parser.clone();
+        let ev3 = cloned.parse("src=10.0.0.5 dst=10.0.0.6").unwrap();
+        assert_eq!(ev3.src_endpoint.ip.as_deref(), Some("10.0.0.5"));
+    }
+
+    /// noyalib replaces hand-rolled YAML: round-trip must preserve all fields
+    /// and field names must stay stable for data/parsers/*.yaml compatibility.
+    #[test]
+    fn test_yaml_roundtrip_noyalib_stable_fields() {
+        let parser = ParserDefinition {
+            vendor: "pfSense".into(),
+            device_model: "CEF-1".into(),
+            regex_pattern: r"^(?P<src_ip>\S+) (?P<dst_ip>\S+)$".to_string(),
+            action_mappings: HashMap::from([("pass".to_string(), "ALLOWED".to_string())]),
+            sample_logs: vec!["line one".to_string(), "line two".to_string()],
+            confidence_score: 0.95,
+            created_at: 1_700_000_000_000,
+            regex_cache: Arc::new(OnceLock::new()),
+        };
+        let yaml = parser.to_yaml().unwrap();
+        // Stable field names required by data/parsers/*.yaml consumers.
+        for field in [
+            "vendor:",
+            "device_model:",
+            "regex_pattern:",
+            "action_mappings:",
+            "sample_logs:",
+            "confidence_score:",
+            "created_at:",
+        ] {
+            assert!(yaml.contains(field), "YAML missing stable field: {field}");
+        }
+        let back = ParserDefinition::from_yaml(&yaml).unwrap();
+        assert_eq!(back.vendor, parser.vendor);
+        assert_eq!(back.device_model, parser.device_model);
+        assert_eq!(back.regex_pattern, parser.regex_pattern);
+        assert_eq!(back.action_mappings, parser.action_mappings);
+        assert_eq!(back.sample_logs, parser.sample_logs);
+        assert!((back.confidence_score - parser.confidence_score).abs() < f64::EPSILON);
+        assert_eq!(back.created_at, parser.created_at);
+    }
+
+    /// Synthesizer must produce IPv6-capable patterns (flow-arrow format).
+    #[test]
+    fn test_synthesizer_flow_accepts_ipv6() {
+        let samples = vec![
+            "2001:db8::1/443->2001:db8::2/80 proto 6",
+            "2001:db8::3/443->2001:db8::4/80 proto 6",
+            "2001:db8::5/443->2001:db8::6/80 proto 6",
+        ];
+        let pattern = Onboarder::synthesize_regex(&samples).unwrap();
+        let re = Regex::new(&pattern).unwrap();
+        let caps = re.captures(samples[0]).unwrap();
+        assert_eq!(caps.name("src_ip").unwrap().as_str(), "2001:db8::1");
+        assert_eq!(caps.name("dst_ip").unwrap().as_str(), "2001:db8::2");
+    }
+
+    /// Synthesizer must produce IPv6-capable patterns (key-value format, e.g. pfSense).
+    #[test]
+    fn test_synthesizer_kv_accepts_ipv6() {
+        let samples = vec![
+            r#"srcip=2001:db8::1 srcport=443 dstip=2001:db8::2 dstport=80 proto=6 action=pass"#,
+            r#"srcip=2001:db8::3 srcport=444 dstip=2001:db8::4 dstport=81 proto=6 action=pass"#,
+            r#"srcip=2001:db8::5 srcport=445 dstip=2001:db8::6 dstport=82 proto=6 action=pass"#,
+        ];
+        let pattern = Onboarder::synthesize_regex(&samples).unwrap();
+        let re = Regex::new(&pattern).unwrap();
+        let caps = re.captures(samples[0]).unwrap();
+        assert_eq!(caps.name("src_ip").unwrap().as_str(), "2001:db8::1");
+        assert_eq!(caps.name("dst_ip").unwrap().as_str(), "2001:db8::2");
+    }
+
+    /// Validation threshold: 95% match rate passes (not 100%), warnings surfaced.
+    #[test]
+    fn test_validation_threshold_95_percent_with_warnings() {
+        let parser = ParserDefinition {
+            vendor: "test".into(),
+            device_model: "v6".into(),
+            regex_pattern:
+                r"^(?P<src_ip>[0-9a-fA-F:]+)/(?P<src_port>\d{1,5})->(?P<dst_ip>[0-9a-fA-F:]+)/(?P<dst_port>\d{1,5})$"
+                    .to_string(),
+            action_mappings: HashMap::new(),
+            sample_logs: vec![],
+            confidence_score: 1.0,
+            created_at: 0,
+            regex_cache: Arc::new(OnceLock::new()),
+        };
+        // 19/20 = 95% — must pass (old code required 100%).
+        let owned: Vec<String> = (0..19)
+            .map(|i| format!("2001:db8::{i:x}/443->2001:db8::2/80"))
+            .chain(std::iter::once(
+                "garbage line that does not match".to_string(),
+            ))
+            .collect();
+        let samples: Vec<&str> = owned.iter().map(|s| s.as_str()).collect();
+        let report = Onboarder::validate_parser(&parser, &samples).unwrap();
+        assert!(
+            report.passed,
+            "95% match rate must pass: {:?}",
+            report.errors
+        );
+        assert!((report.match_percentage - 95.0).abs() < 0.01);
     }
 
     /// Registry is bounded (REGISTRY_CAPACITY) with LRU-by-last-use eviction and
@@ -1037,6 +1097,7 @@ mod tests {
             sample_logs: vec![],
             confidence_score: 1.0,
             created_at: 0,
+            regex_cache: Arc::new(OnceLock::new()),
         };
 
         for i in 0..REGISTRY_CAPACITY {

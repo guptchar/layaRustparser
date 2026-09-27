@@ -656,6 +656,7 @@ pub async fn post_parsers_test(
                 sample_logs: vec![raw.to_string()],
                 confidence_score: 1.0,
                 created_at: Utc::now().timestamp_millis(),
+                regex_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
             };
             def.parse(raw).ok()
         } else {
