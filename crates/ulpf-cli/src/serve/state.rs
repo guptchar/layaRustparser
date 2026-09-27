@@ -54,6 +54,15 @@ pub struct AppState {
     pub scratch_dir: PathBuf,
     pub registry: Arc<RwLock<DynamicParserRegistry>>,
     pub alerts: Arc<RwLock<Vec<AlertItem>>>,
+    /// Serializes the read-snapshot → publish → rollback sequence in
+    /// `POST /onboard`. Two concurrent requests for the same `vendor:model` slug
+    /// would otherwise interleave: B snapshots (files absent), A publishes and
+    /// returns 201, B's YAML write fails, and B's `None`-prior rollback deletes
+    /// A's published pair while A's parser stays registered in memory — a parser
+    /// that answered 201 is gone after a restart. One lock around the whole
+    /// transaction is enough; it is uncontended in the normal single-request
+    /// case and never touches the ingest path.
+    pub persist_lock: Arc<tokio::sync::Mutex<()>>,
     pub start_time: Instant,
     pub mock_eps: Arc<AtomicU64>,
 }
@@ -104,6 +113,7 @@ impl AppState {
             scratch_dir,
             registry: Arc::new(RwLock::new(registry)),
             alerts: Arc::new(RwLock::new(initial_alerts)),
+            persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             start_time: Instant::now(),
             mock_eps: Arc::new(AtomicU64::new(142_500)),
         }

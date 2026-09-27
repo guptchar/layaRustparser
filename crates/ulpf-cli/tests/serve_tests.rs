@@ -361,6 +361,7 @@ async fn test_serve_tamper_drill_isolation() {
             ulpf_ai::onboarder::DynamicParserRegistry::new(),
         )),
         alerts: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        persist_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         start_time: std::time::Instant::now(),
         mock_eps: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(140000)),
     };

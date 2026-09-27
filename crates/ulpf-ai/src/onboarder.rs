@@ -649,8 +649,11 @@ impl Onboarder {
 
         // Classification uses REAL address validation, never a character class.
         // A permissive `[0-9a-fA-F.:%]+` also matches a wall-clock `14:00:01`,
-        // so a timestamp column was captured as `src_ip=14:00` + `src_port=01`
-        // and then rejected by `validate_parser` — three samples, zero parsers.
+        // so a time-of-day column was captured as `src_ip=14:00` +
+        // `src_port=01` and then rejected by `validate_parser` — three samples,
+        // zero parsers. `is_ip`/`is_ip_port` reject it and it falls through to
+        // `(?:\S+)`, so the timestamp branch below only ever sees a
+        // DATE-prefixed column (`re_timestamp` requires `\d{4}-\d{2}-\d{2}`).
         // `parse_ip` is also the only way to tell a bare IPv6 address
         // (`2001:db8::1`) from the ambiguous `IP:port` form: both are legal IPv6
         // *and* legal host:port strings, so a complete-valid-IP check must come
@@ -680,6 +683,7 @@ impl Onboarder {
         let mut parts = Vec::new();
         let mut ip_count = 0;
         let mut port_count = 0;
+        let mut has_timestamp = false;
 
         for i in 0..min_len {
             let col: Vec<&str> = split_lines.iter().map(|l| l[i]).collect();
@@ -689,9 +693,17 @@ impl Onboarder {
                 // Static anchor token: escape special regex characters
                 parts.push(regex::escape(col[0]));
             } else if col.iter().all(|t| re_timestamp.is_match(t)) {
-                // MUST precede the endpoint branches: an `HH:MM:SS` column is
-                // not an address, and the loose class would happily take it.
-                parts.push(r"(?P<timestamp>\S+)".to_string());
+                // Date column. Name only the FIRST one: a second date column
+                // (start/end) would emit a duplicate `timestamp` group, and a
+                // pattern with duplicate names fails to compile — which
+                // `validate_parser` would then reject as an unparseable
+                // definition.
+                if has_timestamp {
+                    parts.push(r"(?:\S+)".to_string());
+                } else {
+                    parts.push(r"(?P<timestamp>\S+)".to_string());
+                    has_timestamp = true;
+                }
             } else if col.iter().all(|t| is_ip_port(t)) {
                 // Genuine `IP:port` / `IP/port`, where the address half really
                 // parses AND the whole token is not itself a valid address (so
@@ -1500,6 +1512,28 @@ mod tests {
                 "a parser validated against {empty:?} must not be admitted"
             );
         }
+    }
+
+    /// Two date columns (start/end) must not emit two `timestamp` groups —
+    /// duplicate capture names make the pattern fail to compile, so the
+    /// synthesized parser would be rejected by its own validator.
+    #[test]
+    fn test_positional_synthesizer_two_date_columns_compile() {
+        let samples = vec![
+            "2026-09-21 2026-09-22 10.0.0.1 10.0.0.2 TCP accept",
+            "2026-09-23 2026-09-24 10.0.0.3 10.0.0.4 TCP accept",
+            "2026-09-25 2026-09-26 10.0.0.5 10.0.0.6 TCP accept",
+        ];
+        let pattern = Onboarder::synthesize_regex(&samples).unwrap();
+        let re = Regex::new(&pattern).expect("pattern with 2 date columns must compile");
+        let caps = re.captures(samples[0]).unwrap();
+        assert_eq!(
+            caps.name("timestamp").map(|m| m.as_str()),
+            Some("2026-09-21"),
+            "the FIRST date column takes the named group"
+        );
+        assert_eq!(caps.name("src_ip").map(|m| m.as_str()), Some("10.0.0.1"));
+        assert_eq!(caps.name("dst_ip").map(|m| m.as_str()), Some("10.0.0.2"));
     }
 
     /// A wall-clock column is not an address. The permissive `[0-9a-fA-F.:%]+`

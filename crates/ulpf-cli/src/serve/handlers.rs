@@ -717,6 +717,11 @@ static PUBLISH_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// On any failure the temp files are removed and any already-renamed target
 /// is rolled back to its prior contents (or removed if it did not exist),
 /// so there is no window where only one half of the pair exists.
+///
+/// A rollback that itself fails is NOT swallowed: the returned error names
+/// both the original publish failure and whatever could not be undone, because
+/// silently reporting only the first would leave a caller believing the
+/// directory is clean when it is not.
 fn publish_parser_pair(
     dir: &std::path::Path,
     json_file: &str,
@@ -740,45 +745,76 @@ fn publish_parser_pair(
     let json_tmp = dir.join(format!("{json_file}.{tag}"));
     let yaml_tmp = dir.join(format!("{yaml_file}.{tag}"));
 
-    // Best-effort cleanup: drop the temps, then undo any rename that
-    // already happened. Targets that were never renamed are untouched —
-    // the originals are still whole on disk.
-    let rollback = |json_renamed: bool, yaml_renamed: bool| {
-        let _ = std::fs::remove_file(&json_tmp);
-        let _ = std::fs::remove_file(&yaml_tmp);
-        for (path, prior, renamed) in [
-            (&json_path, &prior_json, json_renamed),
-            (&yaml_path, &prior_yaml, yaml_renamed),
+    // Clean up the temps, then undo any rename that already happened. Targets
+    // that were never renamed are untouched — the originals are still whole on
+    // disk. Restores go through their own temp + rename for the same reason the
+    // publish does: a plain `write` to the target truncates it first, so a
+    // failed restore would leave the previous definition destroyed rather than
+    // merely unreverted.
+    let rollback = |json_renamed: bool, yaml_renamed: bool| -> std::io::Result<()> {
+        let mut problems: Vec<String> = Vec::new();
+        // A temp that is already gone is the EXPECTED case, not a problem: the
+        // half that renamed successfully no longer has one. Reporting it would
+        // make every clean rollback claim to be incomplete.
+        let mut drop_temp = |r: std::io::Result<()>, what: &str| match r {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => problems.push(format!("{what}: {e}")),
+            Ok(()) => {}
+        };
+
+        drop_temp(std::fs::remove_file(&json_tmp), "temp json");
+        drop_temp(std::fs::remove_file(&yaml_tmp), "temp yaml");
+        for (path, prior, renamed, what) in [
+            (&json_path, &prior_json, json_renamed, "json"),
+            (&yaml_path, &prior_yaml, yaml_renamed, "yaml"),
         ] {
             if !renamed {
                 continue;
             }
-            match prior {
+            let r = match prior {
                 Some(bytes) => {
-                    let _ = std::fs::write(path, bytes);
+                    let restore_tmp = dir.join(format!(
+                        "{}.rollback-{tag}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    std::fs::write(&restore_tmp, bytes)
+                        .and_then(|()| std::fs::rename(&restore_tmp, path))
                 }
-                None => {
-                    let _ = std::fs::remove_file(path);
-                }
+                None => std::fs::remove_file(path),
+            };
+            if let Err(e) = r {
+                problems.push(format!("{what}: {e}"));
             }
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(problems.join("; ")))
         }
     };
 
     // Stage BOTH payloads before either becomes visible: a failure here
     // leaves the originals untouched.
+    let fail = |e: std::io::Error, json_renamed: bool, yaml_renamed: bool| match rollback(
+        json_renamed,
+        yaml_renamed,
+    ) {
+        Ok(()) => e,
+        Err(rollback_err) => std::io::Error::other(format!(
+            "publish failed: {e}; and the rollback was incomplete: {rollback_err}"
+        )),
+    };
+
     if let Err(e) =
         std::fs::write(&json_tmp, json_str).and_then(|()| std::fs::write(&yaml_tmp, yaml_str))
     {
-        rollback(false, false);
-        return Err(e);
+        return Err(fail(e, false, false));
     }
     if let Err(e) = std::fs::rename(&json_tmp, &json_path) {
-        rollback(false, false);
-        return Err(e);
+        return Err(fail(e, false, false));
     }
     if let Err(e) = std::fs::rename(&yaml_tmp, &yaml_path) {
-        rollback(true, false);
-        return Err(e);
+        return Err(fail(e, true, false));
     }
     Ok(())
 }
@@ -880,6 +916,13 @@ pub async fn post_onboard(
     }
     let json_file = format!("{}.json", vendor_slug);
     let yaml_file = format!("{}.yaml", vendor_slug);
+
+    // Take the persistence lock BEFORE snapshotting: the snapshot, the two
+    // renames, and any rollback are one transaction over this slug. Without it
+    // two concurrent requests for the same vendor interleave and the loser's
+    // rollback can delete the winner's published pair. Held across the `await`
+    // on the registry below, so a parser is never left on disk unregistered.
+    let _persist_guard = state.persist_lock.lock().await;
 
     let json_path = state.parsers_dir.join(&json_file);
     let yaml_path = state.parsers_dir.join(&yaml_file);
@@ -1446,6 +1489,34 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("fw.yaml")).unwrap(),
             "NEW-YAML"
+        );
+        assert_no_tmps(&dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rollback that completes cleanly must report ONLY the publish failure.
+    ///
+    /// The half that renamed successfully no longer has a temp file, so
+    /// `remove_file` on it returns `NotFound` — which is the expected case, not
+    /// a rollback problem. Counting it made every clean rollback report itself
+    /// as incomplete, which would train operators to ignore that signal.
+    #[test]
+    fn test_publish_pair_clean_rollback_reports_only_publish_failure() {
+        let dir = scratch_dir("cleanrollback");
+        std::fs::write(dir.join("fw.json"), "OLD-JSON").unwrap();
+        std::fs::create_dir(dir.join("fw.yaml")).expect("blocker dir must be creatable");
+
+        let err = publish_parser_pair(&dir, "fw.json", "fw.yaml", "NEW-JSON", "NEW-YAML")
+            .expect_err("blocked YAML rename must fail");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("rollback was incomplete"),
+            "a rollback that restored cleanly must NOT claim incompleteness: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("fw.json")).unwrap(),
+            "OLD-JSON",
+            "prior contents must be back"
         );
         assert_no_tmps(&dir);
         std::fs::remove_dir_all(&dir).ok();
