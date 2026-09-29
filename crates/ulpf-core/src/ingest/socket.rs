@@ -116,6 +116,11 @@ pub fn tcp_listener_rcvbuf(listener: &TcpListener) -> io::Result<usize> {
     socket2::SockRef::from(listener).recv_buffer_size()
 }
 
+/// Capacity of the internal socket-to-parser channel in
+/// [`UdpSyslogListener::run_parsed`], in batches. Sized to absorb a brief
+/// parser stall in the queue rather than by shedding.
+const RAW_BATCH_CHANNEL: usize = 8;
+
 /// Point-in-time view of a [`BatchSender`] handoff channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChannelStats {
@@ -205,10 +210,23 @@ impl<T: Send + 'static> BatchSender<T> {
     /// Wrap an existing bounded channel. `batch_size` pre-allocates each
     /// outgoing batch; `tx` carries the real capacity.
     pub fn new(tx: mpsc::Sender<Vec<T>>, batch_size: usize) -> Self {
+        Self::with_stats(tx, batch_size, BatchChannelStats::default())
+    }
+
+    /// Like [`BatchSender::new`], but writing into caller-owned counters.
+    ///
+    /// [`UdpSyslogListener::run_parsed`] builds its socket-to-parser hop
+    /// internally, so this is how a caller keeps a handle on the receive
+    /// side's drop counters while that hop runs inside the method.
+    pub fn with_stats(
+        tx: mpsc::Sender<Vec<T>>,
+        batch_size: usize,
+        stats: BatchChannelStats,
+    ) -> Self {
         Self {
             tx,
             batch_size,
-            stats: BatchChannelStats::default(),
+            stats,
         }
     }
 
@@ -240,6 +258,31 @@ impl<T: Send + 'static> BatchSender<T> {
                 true
             }
             Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
+    /// Await handoff of one batch, applying real backpressure.
+    ///
+    /// **Reliable transports only** (see [`TcpSyslogListener::run_raw`]). When
+    /// the channel is full this parks until the consumer drains a slot. That
+    /// is safe precisely because the transport is reliable: the reader stops
+    /// pulling from the stream, the TCP receive window fills, and the kernel
+    /// throttles the sender. The client is never told a line was discarded,
+    /// because none was — it just waits.
+    ///
+    /// Counting stays symmetric with [`BatchSender::send_batch`]: a delivered
+    /// batch counts as sent, and `false` means the consumer is gone.
+    pub async fn send_batch_async(&self, batch: Vec<T>) -> bool {
+        let lines = batch.len();
+        match self.tx.send(batch).await {
+            Ok(()) => {
+                self.stats.record_sent(lines);
+                true
+            }
+            // The receiver dropped while we were parked. There is no consumer
+            // left to shed the batch to, so this is a shutdown, not a loss to
+            // count.
+            Err(_) => false,
         }
     }
 
@@ -288,38 +331,62 @@ impl UdpSyslogListener {
     /// the next datagram, so each line must be lifted into its own allocation
     /// to outlive this iteration.
     pub async fn run_raw(self, sink: BatchSender<Bytes>) -> anyhow::Result<()> {
-        self.pump(sink, |line| Bytes::copy_from_slice(line.as_bytes()))
-            .await
+        self.pump(sink).await
     }
 
-    /// Run the UDP packet receiver, parsing logs inline with
-    /// [`UniversalParser`] and forwarding normalized OCSF events onward.
+    /// Run the UDP packet receiver, parsing with [`UniversalParser`] and
+    /// forwarding normalized OCSF events onward.
     ///
-    /// Parsing happens in the recv task itself rather than behind a second
-    /// channel. The old shape spawned `run_raw` into its own `mpsc` and then
-    /// drained it here, which paid an extra `Vec` allocation, an extra hop,
-    /// and a second bounded queue to apply backpressure to — all to move a
-    /// batch from one function to the one line below it.
+    /// **Parsing deliberately does not happen on the receive loop.** The
+    /// receive side runs in its own task via [`UdpSyslogListener::run_raw`],
+    /// handing raw batches onward without ever blocking. Only this task
+    /// parses. If `parse_lossless` were called inline on the receive loop, a
+    /// parser slower than the arrival rate would delay the next `recv_from`,
+    /// the kernel would start dropping datagrams, and those drops would be
+    /// invisible: `send_batch` has not run yet, so no counter could record
+    /// them. Keeping the receive loop doing nothing but receiving is what
+    /// makes the shed accounting complete.
     ///
-    /// Note there is no per-line allocation on this path at all: lines are
-    /// parsed straight out of the borrowed datagram buffer.
+    /// Both hops are bounded and non-blocking, so the two loss points stay
+    /// distinct and separately counted: `recv_stats` accounts for batches
+    /// shed between socket and parser, `sink` for those shed after parsing.
+    /// The caller owns `recv_stats` so it can poll receive-side counters from
+    /// another task while this one is running.
     pub async fn run_parsed(
         self,
         parser: Arc<UniversalParser>,
         sink: BatchSender<NetworkActivity>,
+        recv_stats: BatchChannelStats,
     ) -> anyhow::Result<()> {
-        self.pump(sink, move |line| parser.parse_lossless(line))
-            .await
+        let (raw_tx, mut raw_rx) = mpsc::channel::<Vec<Bytes>>(RAW_BATCH_CHANNEL);
+        let raw_sink = BatchSender::with_stats(raw_tx, self.config.batch_size, recv_stats);
+
+        tokio::spawn(async move {
+            let _ = self.run_raw(raw_sink).await;
+        });
+
+        while let Some(raw_batch) = raw_rx.recv().await {
+            let mut parsed_batch = Vec::with_capacity(raw_batch.len());
+            for raw_line in raw_batch {
+                // These bytes were validated as UTF-8 when the datagram was
+                // decoded, so this is a borrow of the same allocation.
+                match std::str::from_utf8(&raw_line) {
+                    Ok(text) => parsed_batch.push(parser.parse_lossless(text)),
+                    Err(_) => tracing::warn!("skipping non-UTF-8 line in raw batch"),
+                }
+            }
+            if !sink.send_batch(parsed_batch) {
+                break;
+            }
+        }
+
+        Ok(())
     }
 
-    /// Shared UDP recv loop: decode each datagram into lines, map each line,
-    /// and flush on size or timeout. One loop serves both `run_raw` and
-    /// `run_parsed` so the batching and shedding policy cannot drift apart.
-    async fn pump<T, F>(self, sink: BatchSender<T>, mut map: F) -> anyhow::Result<()>
-    where
-        T: Send + 'static,
-        F: FnMut(&str) -> T,
-    {
+    /// Shared UDP recv loop: decode each datagram into a batch of [`Bytes`]
+    /// and flush on size or timeout. Deliberately mapping-free — this is the
+    /// loop that must not do work proportional to the parser.
+    async fn pump(self, sink: BatchSender<Bytes>) -> anyhow::Result<()> {
         let mut buf = vec![0u8; self.config.buffer_capacity];
         let mut current_batch = sink.empty_batch();
         let mut last_flush = tokio::time::Instant::now();
@@ -334,7 +401,7 @@ impl UdpSyslogListener {
                                 for line in text.lines() {
                                     let trimmed = line.trim();
                                     if !trimmed.is_empty() {
-                                        current_batch.push(map(trimmed));
+                                        current_batch.push(Bytes::copy_from_slice(trimmed.as_bytes()));
                                         if current_batch.len() >= self.config.batch_size {
                                             let batch = std::mem::replace(&mut current_batch, sink.empty_batch());
                                             if !sink.send_batch(batch) {
@@ -390,6 +457,19 @@ impl TcpSyslogListener {
     /// One [`BatchSender`] is shared by every connection, so the depth and
     /// drop counters describe the transport as a whole rather than per
     /// connection.
+    ///
+    /// **Delivery semantics: no silent loss.** Batches are handed off with
+    /// [`BatchSender::send_batch_async`], which awaits rather than sheds. TCP
+    /// differs from UDP here in a way that matters: shedding a batch the
+    /// client already delivered would discard data the sender has no way to
+    /// learn was lost — it gets no error, and TCP considers delivery complete.
+    /// Awaiting instead stops the reader, fills the receive window, and lets
+    /// the kernel throttle the sender, so a slow consumer becomes
+    /// backpressure rather than data loss. This preserves the pre-`Bytes`
+    /// await behavior deliberately, unlike the UDP path which does shed.
+    ///
+    /// The cost is that a stalled consumer can park a connection task. That
+    /// is the intended trade on a reliable transport.
     pub async fn run_raw(self, sink: BatchSender<Bytes>) -> anyhow::Result<()> {
         let batch_size = self.config.batch_size;
         let batch_timeout = self.config.batch_timeout;
@@ -424,7 +504,7 @@ impl TcpSyslogListener {
                                 {
                                     let to_send =
                                         std::mem::replace(&mut batch, sink_conn.empty_batch());
-                                    if !sink_conn.send_batch(to_send) {
+                                    if !sink_conn.send_batch_async(to_send).await {
                                         break;
                                     }
                                     last_flush = tokio::time::Instant::now();
@@ -432,8 +512,11 @@ impl TcpSyslogListener {
                             }
                         }
 
+                        // Tail flush on disconnect. Awaited like every other
+                        // handoff here, so a client that sent its last line
+                        // and closed still has that line delivered.
                         if !batch.is_empty() {
-                            sink_conn.send_batch(batch);
+                            sink_conn.send_batch_async(batch).await;
                         }
                     });
                 }
@@ -445,14 +528,32 @@ impl TcpSyslogListener {
     }
 }
 
+/// Counters for one worker's two bounded hops.
+#[derive(Debug, Clone)]
+pub struct UdpWorkerStats {
+    /// Socket-to-parser hop. Drops here mean the parser could not keep up.
+    pub recv: BatchChannelStats,
+    /// Parser-to-consumer hop. Drops here mean the consumer could not keep up.
+    pub out: BatchChannelStats,
+}
+
+impl UdpWorkerStats {
+    /// Total lines shed across both hops. Tracked separately because the two
+    /// mean different things operationally: `recv` sheds are parser lag,
+    /// `out` sheds are downstream saturation.
+    pub fn total_dropped_lines(&self) -> u64 {
+        self.recv.counters().dropped_lines + self.out.counters().dropped_lines
+    }
+}
+
 /// Handles and per-worker counters for a [`spawn_udp_worker_pool`] pool.
 pub struct UdpWorkerPool {
     /// Join handles for the spawned recv tasks, in worker order.
     pub handles: Vec<tokio::task::JoinHandle<()>>,
-    /// Counter handles matching `handles` index-for-index. Each worker owns a
-    /// clone, so a stalled worker stays visible instead of hiding behind a
+    /// Counter handles matching `handles` index-for-index. Each worker owns
+    /// its own, so a stalled worker stays visible instead of hiding behind a
     /// pool-wide total.
-    pub stats: Vec<BatchChannelStats>,
+    pub stats: Vec<UdpWorkerStats>,
 }
 
 /// Spawns a multi-worker UDP listener pool using SO_REUSEPORT across worker threads
@@ -470,10 +571,14 @@ pub fn spawn_udp_worker_pool(
         let parser_clone = Arc::clone(&parser);
         let batch_size = config.batch_size;
         let sink = BatchSender::new(tx.clone(), batch_size);
-        stats.push(sink.stats());
+        let recv_stats = BatchChannelStats::default();
+        stats.push(UdpWorkerStats {
+            recv: recv_stats.clone(),
+            out: sink.stats(),
+        });
 
         let handle = tokio::spawn(async move {
-            let _ = listener.run_parsed(parser_clone, sink).await;
+            let _ = listener.run_parsed(parser_clone, sink, recv_stats).await;
         });
 
         handles.push(handle);
@@ -546,7 +651,9 @@ mod tests {
         let sink = BatchSender::new(tx, 2);
 
         let server_handle = tokio::spawn(async move {
-            let _ = listener.run_parsed(parser, sink).await;
+            let _ = listener
+                .run_parsed(parser, sink, BatchChannelStats::default())
+                .await;
         });
 
         // Send test UDP packet
@@ -711,5 +818,142 @@ mod tests {
         let busy = sink.snapshot();
         assert_eq!(busy.depth, 2, "two batches are queued");
         assert_eq!(busy.sent_batches, 2);
+    }
+
+    /// Regression guard for the review finding that pushed parsing off the
+    /// receive loop.
+    ///
+    /// `run_parsed` must keep the socket read on its own task. If parsing were
+    /// inlined into the receive loop, a slow parser would delay `recv_from`,
+    /// the kernel would drop datagrams, and the counters would report zero
+    /// drops while data silently vanished — the exact invisible-loss failure
+    /// this design exists to prevent.
+    ///
+    /// Observable proxy: stall the output channel so the parse task is forced
+    /// to park, then confirm the receive-side hop keeps draining the socket on
+    /// its own. Receive-side counters must still climb while output is stalled.
+    #[tokio::test]
+    async fn test_receive_loop_drains_while_parser_is_stalled() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut config = IngestConfig::default();
+        config.bind_addr = addr;
+        config.batch_size = 1;
+        config.batch_timeout = Duration::from_millis(5);
+
+        let listener = UdpSyslogListener::bind(config).unwrap();
+        let actual_addr = listener.local_addr().unwrap();
+
+        // Output capacity 1 and nothing drains it: the parse task parks almost
+        // immediately, so only an independent recv loop can keep up.
+        let (tx, _rx) = mpsc::channel(1);
+        let sink = BatchSender::new(tx, 1);
+        let recv_stats = BatchChannelStats::default();
+        let recv_handle = recv_stats.clone();
+
+        let parser = Arc::new(UniversalParser::new());
+        let server = tokio::spawn(async move {
+            let _ = listener.run_parsed(parser, sink, recv_stats).await;
+        });
+
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let line = "%ASA-6-302013: Built outbound TCP connection 1000672 for outside:203.0.113.54/25 to inside:10.1.6.180/52369\n";
+        for _ in 0..20 {
+            let _ = sender.send_to(line.as_bytes(), actual_addr).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let recv_counters = recv_handle.counters();
+
+        assert!(
+            recv_counters.sent_lines > 0,
+            "receive-side hop must keep draining the socket while the parser is stalled"
+        );
+
+        server.abort();
+    }
+
+    /// TCP must not shed. Unlike UDP, a batch the client already delivered
+    /// cannot be discarded without the client having any way to learn it was
+    /// lost. `send_batch_async` must park instead of dropping.
+    #[tokio::test]
+    async fn test_async_send_waits_instead_of_shedding() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sink = BatchSender::new(tx, 2);
+        let stats = sink.stats();
+
+        // Occupy the single slot.
+        assert!(sink.send_batch_async(vec![Bytes::from("first")]).await);
+
+        // This one has nowhere to go until the consumer drains. Park it in a
+        // task rather than timing it out inline: cancelling a live `send`
+        // future strands its slot permit in tokio's mpsc, which would wedge
+        // the channel instead of testing backpressure.
+        let parked = tokio::spawn({
+            let sink = sink.clone();
+            async move {
+                sink.send_batch_async(vec![Bytes::from("second"), Bytes::from("third")])
+                    .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !parked.is_finished(),
+            "send_batch_async must block on a full channel, not drop the batch"
+        );
+        assert_eq!(stats.counters().dropped_batches, 0);
+        assert_eq!(
+            stats.counters().sent_batches,
+            1,
+            "a parked send must not be counted as delivered"
+        );
+
+        // Drain the slot; the parked send must now complete and deliver.
+        let landed = rx.recv().await.expect("first batch");
+        assert_eq!(landed.len(), 1);
+
+        let second = rx.recv().await.expect("second batch delivered after drain");
+        assert_eq!(second.len(), 2, "no lines lost while backpressured");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), parked)
+                .await
+                .expect("parked send completes after drain")
+                .expect("task must not panic"),
+            "send must report delivery once the slot frees"
+        );
+        assert_eq!(stats.counters().dropped_batches, 0);
+        assert_eq!(stats.counters().sent_batches, 2);
+    }
+
+    /// A consumer that vanishes while an async send is parked must end the
+    /// connection task rather than hang or spin. This is the disconnect
+    /// tail-flush path.
+    #[tokio::test]
+    async fn test_async_send_reports_shutdown_when_receiver_drops() {
+        let (tx, rx) = mpsc::channel(1);
+        let sink = BatchSender::new(tx, 2);
+        let stats = sink.stats();
+
+        assert!(sink.send_batch_async(vec![Bytes::from("first")]).await);
+
+        let waiter = tokio::spawn({
+            let sink = sink.clone();
+            async move { sink.send_batch_async(vec![Bytes::from("parked")]).await }
+        });
+
+        // Let the send park, then yank the consumer away.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(rx);
+
+        let result = tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("parked send must not hang forever")
+            .expect("task must not panic");
+        assert!(!result, "a vanished consumer is a shutdown, not a delivery");
+        assert_eq!(
+            stats.counters().dropped_batches,
+            0,
+            "shutdown is not shed loss and must not be counted as such"
+        );
     }
 }
