@@ -25,6 +25,31 @@ fn read_lines(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Truncate to `n` CHARACTERS for a failure diagnostic.
+///
+/// A byte slice like `&line[..160]` panics when byte 160 lands mid-character,
+/// which would abort the test before the recall threshold it was reporting
+/// on — a diagnostic must never be able to take down the gate that prints it.
+/// Log lines are not ASCII in general, so every truncation in this file goes
+/// through here.
+fn head(s: &str, n: usize) -> String {
+    s.chars().take(n).collect()
+}
+
+/// `head` must be the reason a multibyte line can be reported at all. This
+/// pins the guarantee with a string whose byte 3 is mid-character — the exact
+/// case where `&s[..3]` panics.
+#[test]
+fn test_head_truncates_on_character_boundaries() {
+    // 4-byte chars: byte offset 3 falls inside the first one.
+    let s = "αβγδ";
+    assert_eq!(head(s, 2), "αβ");
+    assert_eq!(head(s, 99), s);
+    assert_eq!(head("", 5), "");
+    // Proof the naive form is what we are avoiding.
+    assert!(std::panic::catch_unwind(|| &s[..3]).is_err());
+}
+
 /// Every traffic line in the corpora: (relative path, line). Ground-truth
 /// sidecars (`gt.jsonl`, `*.csv`) are included deliberately — a pattern that
 /// fires on metadata shaped like another vendor's traffic is still
@@ -138,7 +163,7 @@ fn test_cef_recall_on_fortigate_cef_lines() {
                     }
                 }
             }
-            Err(e) => failures.push(format!("{}: {e}", &line[..line.len().min(160)])),
+            Err(e) => failures.push(format!("{}: {e}", head(line, 160))),
         }
     }
     let pct = matched as f64 / cef.len() as f64 * 100.0;
@@ -191,7 +216,7 @@ fn test_json_onboard_suricata_eve() {
                 );
                 matched += 1;
             }
-            Err(e) => failures.push(format!("{}: {e}", &line[..line.len().min(160)])),
+            Err(e) => failures.push(format!("{}: {e}", head(line, 160))),
         }
     }
     let pct = matched as f64 / lines.len() as f64 * 100.0;
@@ -234,10 +259,10 @@ fn test_cross_vendor_overmatch_sweep() {
         let is_cef_shape = line.contains("CEF:");
         let is_json_shape = line.trim_start().starts_with('{');
         if !is_cef_shape && cef_re.is_match(&line) {
-            cef_violations.push(format!("{rel}: {}", &line[..line.len().min(160)]));
+            cef_violations.push(format!("{rel}: {}", head(&line, 160)));
         }
         if !is_json_shape && json_re.is_match(&line) {
-            json_violations.push(format!("{rel}: {}", &line[..line.len().min(160)]));
+            json_violations.push(format!("{rel}: {}", head(&line, 160)));
         }
     }
     assert!(
