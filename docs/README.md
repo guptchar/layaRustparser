@@ -12,6 +12,7 @@
 | [`PRESENTATION.md`](PRESENTATION.md) | 5-slide technical pitch + deliverables checklist. |
 | [`WHY_ULPF.md`](WHY_ULPF.md) | The problem, shipper comparison, vendor matrix, one real line end to end. |
 | [`INGEST_LIMITS.md`](INGEST_LIMITS.md) | Measured socket capacity and backpressure: 50k EPS loss-free per socket, UDP kernel drops vs TCP backpressure, the 500k answer, burst repro recipe. |
+| [`CONTINUING_WORK.md`](CONTINUING_WORK.md) | Research notes for in-flight issues: what the code does today, what was decided, why. |
 | This file (`README.md`) | The full doc index. The short map lives in the root `README.md`. |
 
 Benchmarks (`benchmarks/` — committed, regenerable with `ulpf evaluate`):
