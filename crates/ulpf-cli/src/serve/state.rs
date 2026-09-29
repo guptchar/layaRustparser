@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,6 +8,9 @@ use tokio::sync::RwLock;
 
 use ulpf_ai::drain::AlertSeverity;
 use ulpf_ai::onboarder::DynamicParserRegistry;
+use ulpf_core::ingest::telemetry::{
+    default_snapshot_path, read_snapshot, IngestSnapshot, DEFAULT_STALE_AFTER_MS,
+};
 use ulpf_integrity::batcher::BatchAccumulator;
 use ulpf_integrity::storage::read_parquet_file;
 use ulpf_integrity::tamper::verify_block_with_ledger;
@@ -26,21 +28,79 @@ pub struct AlertItem {
     pub leaf_index: Option<u32>,
 }
 
+/// Provenance for the live-pipeline half of the metrics response.
+///
+/// The dashboard needs to distinguish "measured", "idle", and "ingest is not
+/// running" — three states a bare number cannot express. Without this, a
+/// dashboard that receives `eps: null` cannot tell a stopped pipeline from a
+/// broken response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum TelemetryState {
+    /// A fresh snapshot from a running ingest process.
+    Live,
+    /// A snapshot exists but is older than the staleness bound, or the
+    /// writing process exited without clearing it.
+    Stale,
+    /// No snapshot has ever been written — ingest has not run.
+    Absent,
+}
+
 /// Dynamic metrics snapshot polled by the dashboard.
+///
+/// Every field here is measured. Fields that could not be measured are
+/// `null`, never `0` and never a plausible-looking constant — a consumer must
+/// be able to tell "no traffic" (`0`) from "no measurement" (`null`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsResponse {
-    pub eps: f64,
-    pub latency_p50_micros: f64,
-    pub latency_p99_micros: f64,
-    pub queue_depth: usize,
-    pub queue_capacity: usize,
-    pub dropped_count: u64,
-    pub lru_hit_rate: f64,
-    pub total_ingested: u64,
-    pub total_parsed: u64,
-    pub total_blocks: u64,
-    pub vendor_mix: HashMap<String, f64>,
+    /// Measured events per second, or `null` when no traffic has been seen.
+    pub eps: Option<f64>,
+    /// Median per-line parse latency, or `null` when no line has been timed.
+    pub latency_p50_micros: Option<f64>,
+    /// 99th percentile of the same rolling window.
+    pub latency_p99_micros: Option<f64>,
+    /// Samples behind the latency window, so the percentiles are auditable.
+    pub latency_samples: u64,
+    /// Parser signature-cache hit ratio from the real `LruStats`.
+    pub lru_hit_rate: Option<f64>,
+    /// Lookups behind `lru_hit_rate`.
+    pub lru_lookups: Option<u64>,
+    /// Messages queued in the bounded ingest queue.
+    pub queue_depth: Option<usize>,
+    /// Configured bound on `queue_depth`.
+    pub queue_capacity: Option<usize>,
+    /// Cumulative lines shed by the drop-newest policy.
+    pub dropped_count: Option<u64>,
+    pub total_ingested: Option<u64>,
+    pub total_parsed: Option<u64>,
+    pub total_blocks: Option<u64>,
+    pub total_anomalies: Option<u64>,
+
+    /// Per-vendor **counts**, from the live parsed-event stream.
+    ///
+    /// Counts, not percentages: a percentage with no stated base is exactly
+    /// the kind of number that misleads. An empty map means no vendor has been
+    /// parsed in this ingest process — it is never back-filled with a
+    /// fabricated distribution.
+    pub vendor_mix: HashMap<String, u64>,
+    /// Disposition breakdown over the persisted corpus (see
+    /// `disposition_source` for what "persisted" excludes).
     pub disposition_breakdown: HashMap<String, u64>,
+    /// How many persisted records the disposition breakdown covers.
+    pub disposition_sampled: u64,
+
+    /// Whether the live gauges above are current, stale, or absent.
+    pub telemetry_state: TelemetryState,
+    /// Age of the underlying snapshot in milliseconds, or `null` when absent.
+    pub telemetry_age_ms: Option<u64>,
+    /// Where the disposition counts came from, so a reader knows their base.
+    pub disposition_source: String,
+
+    /// Pipeline health, derived from real signals.
+    ///
+    /// `HEALTHY` / `DEGRADED` come from the measured drop counter;
+    /// `IDLE` means no live pipeline is publishing; `UNKNOWN` means live
+    /// telemetry is unavailable. It is never a constant.
     pub status: String,
 }
 
@@ -65,7 +125,15 @@ pub struct AppState {
     /// ingest path.
     pub persist_lock: Arc<tokio::sync::Mutex<()>>,
     pub start_time: Instant,
-    pub mock_eps: Arc<AtomicU64>,
+    /// Live-telemetry sidecar written by the ingest process.
+    ///
+    /// Public so integration tests can point a state at a temp sidecar and
+    /// assert against real snapshots. Production code should prefer
+    /// [`AppState::new`], which derives this from the ledger path, or
+    /// [`AppState::with_telemetry`] to override it.
+    pub telemetry_path: PathBuf,
+    /// Staleness bound applied to the snapshot before reporting its gauges.
+    pub stale_after_ms: u64,
 }
 
 impl AppState {
@@ -105,6 +173,7 @@ impl AppState {
         }
 
         let initial_alerts = Self::compute_initial_alerts(&parquet_dir, &ledger_path);
+        let telemetry_path = default_snapshot_path(&ledger_path);
 
         Self {
             parquet_dir,
@@ -116,15 +185,35 @@ impl AppState {
             alerts: Arc::new(RwLock::new(initial_alerts)),
             persist_lock: Arc::new(tokio::sync::Mutex::new(())),
             start_time: Instant::now(),
-            mock_eps: Arc::new(AtomicU64::new(142_500)),
+            telemetry_path,
+            stale_after_ms: DEFAULT_STALE_AFTER_MS,
         }
     }
 
-    /// Automatically scans available blocks and computes initial alerts (e.g. tamper alarms).
+    /// Override the sidecar location and staleness bound. Used by tests and by
+    /// any deployment that keeps the two planes on separate volumes.
+    pub fn with_telemetry(mut self, path: PathBuf, stale_after_ms: u64) -> Self {
+        self.telemetry_path = path;
+        self.stale_after_ms = stale_after_ms;
+        self
+    }
+
+    /// Where this state reads live telemetry from.
+    pub fn telemetry_path(&self) -> &Path {
+        &self.telemetry_path
+    }
+
+    /// Scan available blocks for real alerts.
+    ///
+    /// Every alert here is derived from an actual verification or parse; none
+    /// are seeded to make a demo feed look populated. An empty corpus yields
+    /// an empty feed, which is the correct answer.
     pub fn compute_initial_alerts(parquet_dir: &Path, ledger_path: &Path) -> Vec<AlertItem> {
         let mut alerts = Vec::new();
 
-        // Audit block 0 if present (intentionally tampered fixture in repo)
+        // Audit block 0 if present (intentionally tampered fixture in repo).
+        // This is a real `verify_block_with_ledger` call: if the block verifies
+        // clean, no alarm is raised, and if it is absent, none is invented.
         let block_0 = parquet_dir.join("block_00000.parquet");
         if block_0.exists() && ledger_path.exists() {
             if let Ok(report) = verify_block_with_ledger(&block_0, ledger_path) {
@@ -155,29 +244,12 @@ impl AppState {
             }
         }
 
-        // Add Drain template novelty alerts for demo feed
-        alerts.push(AlertItem {
-            id: uuid::Uuid::now_v7().to_string(),
-            alert_type: "new_template_drift".to_string(),
-            severity: AlertSeverity::Medium,
-            timestamp: chrono::Utc::now().timestamp_millis() - 45_000,
-            title: "Parser Drift: Unseen Template Pattern Detected".to_string(),
-            details: "DrainMiner identified novel log template: 'RT_FLOW: session <action> <src_ip>/<src_port>-><dst_ip>/<dst_port>'".to_string(),
-            block_id: Some(1),
-            leaf_index: Some(12),
-        });
-
-        alerts.push(AlertItem {
-            id: uuid::Uuid::now_v7().to_string(),
-            alert_type: "rare_cluster_surge".to_string(),
-            severity: AlertSeverity::Low,
-            timestamp: chrono::Utc::now().timestamp_millis() - 120_000,
-            title: "Traffic Volume Spike in Rare Cluster #4".to_string(),
-            details: "Cluster occurrence exceeded surge multiplier threshold (3.0x above rolling baseline).".to_string(),
-            block_id: Some(1),
-            leaf_index: Some(88),
-        });
-
+        // Drain drift and rare-cluster surges are published by the running
+        // ingest process through the telemetry sidecar while traffic flows.
+        // They are deliberately NOT synthesized here: before this change two
+        // fabricated alerts ("Parser Drift", "Traffic Volume Spike") were
+        // appended unconditionally, so the feed claimed parser drift and a
+        // volume spike on a system that had never seen traffic.
         alerts
     }
 
@@ -188,98 +260,205 @@ impl AppState {
         *lock = alerts;
     }
 
-    /// Computes aggregated metrics from ledger and parquet blocks.
+    /// Read the live telemetry sidecar, if the ingest process wrote one.
+    ///
+    /// A corrupt sidecar is reported as absent-with-warning rather than
+    /// propagated as an error: a broken telemetry file must not take down
+    /// `/metrics`, but it must also not be silently treated as healthy.
+    fn read_live_telemetry(&self) -> Option<IngestSnapshot> {
+        match read_snapshot(&self.telemetry_path) {
+            Ok(snap) => snap,
+            Err(e) => {
+                tracing::warn!("live telemetry unreadable: {e}");
+                None
+            }
+        }
+    }
+
+    /// Aggregated metrics, all measured.
+    ///
+    /// Two sources, kept deliberately separate:
+    ///
+    /// * **Live gauges** (eps, latency, LRU, queue) come from the ingest
+    ///   sidecar, because that is the only place they exist. When the sidecar
+    ///   is absent or stale they report `null`.
+    /// * **Persisted corpus counts** (blocks, dispositions) come from the
+    ///   ledger and Parquet, which outlive any single process.
     pub fn compute_metrics(&self) -> MetricsResponse {
-        let mut total_blocks = 0u64;
-        let mut total_ingested = 0u64;
-        let mut vendor_counts: HashMap<String, u64> = HashMap::new();
-        let mut disp_counts: HashMap<String, u64> = HashMap::new();
+        let (total_blocks, ledger_ingested) = self.read_ledger_totals();
+        let (disposition_breakdown, disposition_sampled) = self.read_dispositions();
 
-        disp_counts.insert("Allowed".to_string(), 0);
-        disp_counts.insert("Blocked".to_string(), 0);
-        disp_counts.insert("Dropped".to_string(), 0);
-
-        if self.ledger_path.exists() {
-            if let Ok(entries) = BatchAccumulator::load_ledger_entries(&self.ledger_path) {
-                total_blocks = entries.len() as u64;
-                for entry in entries {
-                    total_ingested += entry.leaf_count as u64;
+        let live = self.read_live_telemetry();
+        let (telemetry_state, telemetry_age_ms, gauge) = match &live {
+            None => (TelemetryState::Absent, None, IngestSnapshot::default()),
+            Some(snap) => {
+                // `running: false` means the writer exited cleanly. The
+                // monotonic clock is the ingest process's own, so age is only
+                // meaningful while that process is alive to compare against;
+                // a stopped writer is reported stale regardless of the number.
+                if !snap.running {
+                    (TelemetryState::Stale, Some(u64::MAX), snap.clone())
+                } else {
+                    // Age is computed against wall-clock proximity because the
+                    // two processes do not share a monotonic epoch. Comparing
+                    // the snapshot's own age field is impossible across
+                    // processes, so the conservative bound is used: a snapshot
+                    // is current only while its writer says it is still
+                    // running and it was written recently in wall-clock terms.
+                    let age = self.wall_clock_age_ms(snap.unix_ms);
+                    let fresh = age
+                        .map(|a| a <= self.stale_after_ms as i64)
+                        .unwrap_or(false);
+                    let state = if fresh {
+                        TelemetryState::Live
+                    } else {
+                        TelemetryState::Stale
+                    };
+                    // A stale reading is not a live one. Clear the gauges
+                    // rather than serving numbers that quietly stopped
+                    // moving; the cumulative fields survive because they are
+                    // still true, just not current.
+                    let reported = if fresh {
+                        snap.clone()
+                    } else {
+                        snap.without_live_gauges()
+                    };
+                    (state, age.map(|a| a.max(0) as u64), reported)
                 }
             }
-        }
-
-        // Inspect records from available blocks to calculate real vendor mix and dispositions
-        let mut sampled_records = 0u64;
-        if self.parquet_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&self.parquet_dir) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension().and_then(|s| s.to_str()) == Some("parquet") {
-                        if let Ok(records) = read_parquet_file(&p) {
-                            for r in records {
-                                *vendor_counts.entry(r.vendor).or_insert(0) += 1;
-                                if let Ok(val) =
-                                    serde_json::from_str::<serde_json::Value>(&r.ocsf_json)
-                                {
-                                    if let Some(disp) =
-                                        val.get("disposition").and_then(|v| v.as_str())
-                                    {
-                                        *disp_counts.entry(disp.to_string()).or_insert(0) += 1;
-                                    }
-                                }
-                                sampled_records += 1;
-                                if sampled_records >= 5000 {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if sampled_records >= 5000 {
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Calculate vendor percentages
-        let total_sampled = vendor_counts.values().sum::<u64>().max(1) as f64;
-        let mut vendor_mix = HashMap::new();
-        if !vendor_counts.is_empty() {
-            for (vendor, count) in vendor_counts {
-                let pct = (count as f64 / total_sampled) * 100.0;
-                vendor_mix.insert(vendor, (pct * 10.0).round() / 10.0);
-            }
-        } else {
-            // Realistic fallback distribution for SIH demo opener
-            vendor_mix.insert("cisco_asa".to_string(), 32.5);
-            vendor_mix.insert("fortigate".to_string(), 28.0);
-            vendor_mix.insert("paloalto".to_string(), 21.5);
-            vendor_mix.insert("pfsense".to_string(), 12.0);
-            vendor_mix.insert("suricata".to_string(), 6.0);
-        }
-
-        let total_parsed = if total_ingested > 0 {
-            total_ingested
-        } else {
-            sampled_records
         };
 
-        let eps = self.mock_eps.load(Ordering::Relaxed) as f64;
+        let vendor_mix: HashMap<String, u64> = gauge
+            .vendor_counts
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+
+        // Prefer the live counter; fall back to the ledger's leaf total so the
+        // field is never invented but is still meaningful when ingest is idle.
+        let total_ingested = gauge
+            .total_ingested
+            .or(Some(ledger_ingested))
+            .filter(|v| *v > 0);
+        // Same rule for block count: the ledger is the durable authority and
+        // outlives the ingest process, so it wins whenever it has entries. A
+        // cleared (stale) snapshot retains these cumulative fields, so the
+        // fallback keeps working after ingest stops.
+        let total_blocks = if total_blocks > 0 {
+            Some(total_blocks)
+        } else {
+            gauge.total_blocks
+        };
+
+        let status = match telemetry_state {
+            TelemetryState::Live => match gauge.dropped_count {
+                Some(0) => "HEALTHY",
+                Some(_) => "DEGRADED",
+                None => "UNKNOWN",
+            },
+            TelemetryState::Stale => "IDLE",
+            TelemetryState::Absent => "UNKNOWN",
+        }
+        .to_string();
 
         MetricsResponse {
-            eps,
-            latency_p50_micros: 1.28,
-            latency_p99_micros: 4.12,
-            queue_depth: 0,
-            queue_capacity: 50_000,
-            dropped_count: 0,
-            lru_hit_rate: 0.962,
-            total_ingested: total_ingested.max(sampled_records),
-            total_parsed,
+            eps: gauge.eps,
+            latency_p50_micros: gauge.latency_p50_micros,
+            latency_p99_micros: gauge.latency_p99_micros,
+            latency_samples: gauge.latency_samples,
+            lru_hit_rate: gauge.lru_hit_rate,
+            lru_lookups: gauge.lru_lookups,
+            queue_depth: gauge.queue_depth,
+            queue_capacity: gauge.queue_capacity,
+            dropped_count: gauge.dropped_count,
+            total_ingested,
+            total_parsed: gauge.total_parsed,
             total_blocks,
+            total_anomalies: gauge.total_anomalies,
             vendor_mix,
-            disposition_breakdown: disp_counts,
-            status: "HEALTHY".to_string(),
+            disposition_breakdown,
+            disposition_sampled,
+            telemetry_state,
+            telemetry_age_ms,
+            disposition_source: "persisted_parquet_sample".to_string(),
+            status,
+        }
+    }
+
+    /// Total blocks and total leaves from the ledger.
+    fn read_ledger_totals(&self) -> (u64, u64) {
+        if !self.ledger_path.exists() {
+            return (0, 0);
+        }
+        match BatchAccumulator::load_ledger_entries(&self.ledger_path) {
+            Ok(entries) => {
+                let blocks = entries.len() as u64;
+                let leaves = entries.iter().map(|e| e.leaf_count as u64).sum();
+                (blocks, leaves)
+            }
+            // A malformed ledger yields no totals. Reporting zero here would
+            // read as "an empty corpus" rather than "could not be read".
+            Err(e) => {
+                tracing::warn!("ledger unreadable: {e}");
+                (0, 0)
+            }
+        }
+    }
+
+    /// Disposition counts over a bounded sample of persisted records.
+    ///
+    /// Bounded because this runs in the request path; the sample size is
+    /// reported alongside the counts so a reader knows the base. Only
+    /// dispositions actually present are included — an empty corpus produces
+    /// an empty map, never a zeroed template of `Allowed`/`Blocked`/`Dropped`.
+    fn read_dispositions(&self) -> (HashMap<String, u64>, u64) {
+        const MAX_SAMPLE: u64 = 5_000;
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        let mut sampled = 0u64;
+
+        if !self.parquet_dir.exists() {
+            return (counts, sampled);
+        }
+        let Ok(entries) = std::fs::read_dir(&self.parquet_dir) else {
+            return (counts, sampled);
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("parquet") {
+                continue;
+            }
+            let Ok(records) = read_parquet_file(&p) else {
+                continue;
+            };
+            for r in records {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&r.ocsf_json) {
+                    if let Some(disp) = val.get("disposition").and_then(|v| v.as_str()) {
+                        *counts.entry(disp.to_string()).or_insert(0) += 1;
+                    }
+                }
+                sampled += 1;
+                if sampled >= MAX_SAMPLE {
+                    return (counts, sampled);
+                }
+            }
+        }
+        (counts, sampled)
+    }
+
+    /// Milliseconds elapsed since `unix_ms`, or `None` if it is in the future.
+    ///
+    /// The only clock the two processes genuinely share is wall time, so this
+    /// is what staleness has to be judged on. A snapshot stamped in the future
+    /// means the writer's clock is ahead of ours; that is a clock skew, not a
+    /// reason to report a reading as infinitely old, so it reads as
+    /// not-fresh without inventing a huge age.
+    fn wall_clock_age_ms(&self, unix_ms: i64) -> Option<i64> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let age = now - unix_ms;
+        if age < 0 {
+            None
+        } else {
+            Some(age)
         }
     }
 }

@@ -67,12 +67,120 @@ async fn test_serve_get_metrics() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    assert!(json.get("eps").is_some());
-    assert!(json.get("latency_p50_micros").is_some());
-    assert!(json.get("lru_hit_rate").is_some());
-    assert!(json.get("vendor_mix").is_some());
-    assert!(json.get("disposition_breakdown").is_some());
-    assert_eq!(json.get("status").unwrap(), "HEALTHY");
+    for field in [
+        "eps",
+        "latency_p50_micros",
+        "lru_hit_rate",
+        "vendor_mix",
+        "disposition_breakdown",
+        "telemetry_state",
+    ] {
+        assert!(
+            json.get(field).is_some(),
+            "/metrics must still carry `{field}` (value may be null, key must exist)"
+        );
+    }
+}
+
+/// With no ingest process running, there is no telemetry sidecar. Every live
+/// gauge must therefore be `null` — not `0`, and not a plausible constant.
+/// This is the exact failure mode #43 was filed for.
+#[tokio::test]
+async fn test_metrics_reports_null_not_fabricated_when_ingest_absent() {
+    let root = repo_root();
+    let temp_scratch = tempfile::tempdir().unwrap();
+    let state = AppState {
+        parquet_dir: root.join("data/parquet"),
+        ledger_path: root.join("data/ledger.jsonl"),
+        parsers_dir: root.join("data/parsers"),
+        eval_report_path: root.join("docs/benchmarks/eval_hardcore_report.md"),
+        scratch_dir: temp_scratch.path().to_path_buf(),
+        registry: std::sync::Arc::new(tokio::sync::RwLock::new(
+            ulpf_ai::onboarder::DynamicParserRegistry::new(),
+        )),
+        alerts: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        persist_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        start_time: std::time::Instant::now(),
+        telemetry_path: root.join("data/does-not-exist.json"),
+        stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+    };
+    let app = create_router(state);
+    let req = Request::builder()
+        .uri("/metrics")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    for field in [
+        "eps",
+        "latency_p50_micros",
+        "latency_p99_micros",
+        "lru_hit_rate",
+        "queue_depth",
+        "dropped_count",
+    ] {
+        assert_eq!(
+            json.get(field),
+            Some(&serde_json::Value::Null),
+            "`{field}` must be null when nothing has been measured, never a fabricated number"
+        );
+    }
+    assert_eq!(
+        json.get("telemetry_state").unwrap(),
+        "ABSENT",
+        "an absent sidecar must be reported as absent"
+    );
+    assert_ne!(
+        json.get("status").unwrap(),
+        "HEALTHY",
+        "a pipeline that was never measured must not be reported healthy"
+    );
+}
+
+/// An empty corpus must yield an empty vendor map. The old code substituted a
+/// hardcoded `cisco_asa 32.5% / fortigate 28.0% / ...` distribution here.
+#[tokio::test]
+async fn test_metrics_has_no_fabricated_vendor_mix() {
+    let temp_scratch = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+    let state = AppState {
+        parquet_dir: empty.path().join("parquet"),
+        ledger_path: empty.path().join("ledger.jsonl"),
+        parsers_dir: empty.path().join("parsers"),
+        eval_report_path: empty.path().join("eval.json"),
+        scratch_dir: temp_scratch.path().to_path_buf(),
+        registry: std::sync::Arc::new(tokio::sync::RwLock::new(
+            ulpf_ai::onboarder::DynamicParserRegistry::new(),
+        )),
+        alerts: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        persist_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        start_time: std::time::Instant::now(),
+        telemetry_path: empty.path().join("live_telemetry.json"),
+        stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+    };
+    let app = create_router(state);
+    let req = Request::builder()
+        .uri("/metrics")
+        .method("GET")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(
+        json.get("vendor_mix").unwrap(),
+        &serde_json::json!({}),
+        "an empty corpus must report an empty vendor map, not a demo distribution"
+    );
+    assert_eq!(
+        json.get("disposition_breakdown").unwrap(),
+        &serde_json::json!({}),
+        "an empty corpus must not report zeroed Allowed/Blocked/Dropped placeholders"
+    );
 }
 
 #[tokio::test]
@@ -363,7 +471,8 @@ async fn test_serve_tamper_drill_isolation() {
         alerts: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
         persist_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         start_time: std::time::Instant::now(),
-        mock_eps: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(140000)),
+        telemetry_path: root.join("data/live_telemetry.json"),
+        stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
     };
 
     let original_block1_bytes =
@@ -786,9 +895,18 @@ async fn test_serve_state_initialization_deterministic() {
             temp_path,
             root_clone.join("docs/benchmarks/eval_hardcore_report.md"),
         );
+        // There is no longer a baked-in EPS constant to assert on. What
+        // matters is that the state resolves a telemetry sidecar path and
+        // reports no measurement when there is none.
+        assert!(
+            s.telemetry_path().ends_with("live_telemetry.json"),
+            "telemetry path must be derived next to the ledger, got {:?}",
+            s.telemetry_path()
+        );
+        let metrics = s.compute_metrics();
         assert_eq!(
-            s.mock_eps.load(std::sync::atomic::Ordering::Relaxed),
-            142_500
+            metrics.eps, None,
+            "a fresh state must not report an EPS it never measured"
         );
     });
     handle
@@ -859,4 +977,205 @@ async fn test_serve_live_tcp_listener_wire_http1() {
     assert!(metrics.get("disposition_breakdown").is_some());
 
     server_task.abort();
+}
+
+/// A stale snapshot must not keep serving its gauges. This is the
+/// cross-process version of the regression guarded in
+/// `ulpf_core::ingest::telemetry`: a stopped pipeline reporting its last
+/// EPS and latency as though they were live is worse than reporting
+/// nothing, because the dashboard cannot tell the difference.
+#[tokio::test]
+async fn test_metrics_nulls_gauges_when_snapshot_is_stale() {
+    let temp_scratch = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+
+    // A snapshot stamped well in the past: the ingest process is gone.
+    let stale = ulpf_core::ingest::telemetry::IngestSnapshot {
+        monotonic_ms: 1_000,
+        unix_ms: chrono::Utc::now().timestamp_millis() - 60_000,
+        eps: Some(999_999.0),
+        latency_p50_micros: Some(1.28),
+        latency_p99_micros: Some(4.12),
+        latency_samples: 4_096,
+        lru_hit_rate: Some(0.962),
+        lru_lookups: Some(100),
+        queue_depth: Some(42),
+        queue_capacity: Some(50_000),
+        dropped_count: Some(0),
+        total_ingested: Some(780),
+        total_parsed: Some(780),
+        total_blocks: Some(13),
+        total_anomalies: Some(3),
+        vendor_counts: std::collections::BTreeMap::from([("Cisco".to_string(), 260u64)]),
+        running: true,
+    };
+    let sidecar = empty.path().join("live_telemetry.json");
+    ulpf_core::ingest::telemetry::write_snapshot(&sidecar, &stale).unwrap();
+
+    let state = AppState {
+        parquet_dir: empty.path().join("parquet"),
+        ledger_path: empty.path().join("ledger.jsonl"),
+        parsers_dir: empty.path().join("parsers"),
+        eval_report_path: empty.path().join("eval.json"),
+        scratch_dir: temp_scratch.path().to_path_buf(),
+        registry: std::sync::Arc::new(tokio::sync::RwLock::new(
+            ulpf_ai::onboarder::DynamicParserRegistry::new(),
+        )),
+        alerts: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        persist_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        start_time: std::time::Instant::now(),
+        telemetry_path: sidecar,
+        stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+    };
+
+    let metrics = state.compute_metrics();
+
+    for field in [
+        "eps",
+        "latency_p50_micros",
+        "latency_p99_micros",
+        "lru_hit_rate",
+        "queue_depth",
+        "queue_capacity",
+        "dropped_count",
+    ] {
+        assert_eq!(
+            metrics_field(&metrics, field),
+            None,
+            "`{field}` must be null once the snapshot is stale, not the last value it held"
+        );
+    }
+    assert_eq!(
+        metrics.telemetry_state,
+        ulpf_cli::serve::state::TelemetryState::Stale
+    );
+    assert_eq!(metrics.status, "IDLE");
+
+    // Cumulative facts are still true and should survive.
+    assert_eq!(metrics.total_blocks, Some(13));
+    assert_eq!(metrics.vendor_mix.get("Cisco"), Some(&260));
+}
+
+/// A fresh snapshot from a "running" writer must be reported as live, with
+/// its values intact. The counterpart to the staleness test, so neither
+/// branch can be quietly broken.
+#[tokio::test]
+async fn test_metrics_reports_live_snapshot_values() {
+    let temp_scratch = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+
+    let fresh = ulpf_core::ingest::telemetry::IngestSnapshot {
+        monotonic_ms: 10_000,
+        unix_ms: chrono::Utc::now().timestamp_millis(),
+        eps: Some(1234.0),
+        latency_p50_micros: Some(45.45),
+        latency_p99_micros: Some(265.7),
+        latency_samples: 780,
+        lru_hit_rate: Some(0.974),
+        lru_lookups: Some(768),
+        queue_depth: Some(3),
+        queue_capacity: Some(5_000),
+        dropped_count: Some(0),
+        total_ingested: Some(780),
+        total_parsed: Some(780),
+        total_blocks: Some(13),
+        total_anomalies: Some(122),
+        vendor_counts: std::collections::BTreeMap::from([
+            ("Cisco".to_string(), 260u64),
+            ("Fortinet".to_string(), 260u64),
+        ]),
+        running: true,
+    };
+    let sidecar = empty.path().join("live_telemetry.json");
+    ulpf_core::ingest::telemetry::write_snapshot(&sidecar, &fresh).unwrap();
+
+    let state = AppState {
+        parquet_dir: empty.path().join("parquet"),
+        ledger_path: empty.path().join("ledger.jsonl"),
+        parsers_dir: empty.path().join("parsers"),
+        eval_report_path: empty.path().join("eval.json"),
+        scratch_dir: temp_scratch.path().to_path_buf(),
+        registry: std::sync::Arc::new(tokio::sync::RwLock::new(
+            ulpf_ai::onboarder::DynamicParserRegistry::new(),
+        )),
+        alerts: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        persist_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        start_time: std::time::Instant::now(),
+        telemetry_path: sidecar,
+        stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+    };
+
+    let metrics = state.compute_metrics();
+
+    assert_eq!(metrics.eps, Some(1234.0), "a live EPS must be reported");
+    assert_eq!(metrics.latency_p50_micros, Some(45.45));
+    assert_eq!(metrics.latency_p99_micros, Some(265.7));
+    assert_eq!(metrics.lru_hit_rate, Some(0.974));
+    assert_eq!(metrics.queue_depth, Some(3));
+    assert_eq!(metrics.queue_capacity, Some(5_000));
+    assert_eq!(metrics.dropped_count, Some(0));
+    assert_eq!(metrics.total_anomalies, Some(122));
+    assert_eq!(metrics.vendor_mix.get("Cisco"), Some(&260));
+    assert_eq!(
+        metrics.telemetry_state,
+        ulpf_cli::serve::state::TelemetryState::Live
+    );
+    assert_eq!(metrics.status, "HEALTHY", "zero drops + live = healthy");
+}
+
+/// A nonzero measured drop count must degrade the status. This is what
+/// makes `status` a real signal rather than a constant.
+#[tokio::test]
+async fn test_metrics_degrades_status_on_measured_drops() {
+    let temp_scratch = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+
+    let dropping = ulpf_core::ingest::telemetry::IngestSnapshot {
+        monotonic_ms: 10_000,
+        unix_ms: chrono::Utc::now().timestamp_millis(),
+        eps: Some(50_000.0),
+        dropped_count: Some(17),
+        running: true,
+        ..Default::default()
+    };
+    let sidecar = empty.path().join("live_telemetry.json");
+    ulpf_core::ingest::telemetry::write_snapshot(&sidecar, &dropping).unwrap();
+
+    let state = AppState {
+        parquet_dir: empty.path().join("parquet"),
+        ledger_path: empty.path().join("ledger.jsonl"),
+        parsers_dir: empty.path().join("parsers"),
+        eval_report_path: empty.path().join("eval.json"),
+        scratch_dir: temp_scratch.path().to_path_buf(),
+        registry: std::sync::Arc::new(tokio::sync::RwLock::new(
+            ulpf_ai::onboarder::DynamicParserRegistry::new(),
+        )),
+        alerts: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        persist_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        start_time: std::time::Instant::now(),
+        telemetry_path: sidecar,
+        stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+    };
+
+    let metrics = state.compute_metrics();
+    assert_eq!(
+        metrics.status, "DEGRADED",
+        "a measured drop count must degrade the pipeline, not report HEALTHY"
+    );
+    assert_eq!(metrics.dropped_count, Some(17));
+}
+
+/// Helper so the staleness test can assert on the optional numeric fields
+/// without repeating the match in every assertion.
+fn metrics_field(m: &ulpf_cli::serve::state::MetricsResponse, name: &str) -> Option<f64> {
+    match name {
+        "eps" => m.eps,
+        "latency_p50_micros" => m.latency_p50_micros,
+        "latency_p99_micros" => m.latency_p99_micros,
+        "lru_hit_rate" => m.lru_hit_rate,
+        "queue_depth" => m.queue_depth.map(|v| v as f64),
+        "queue_capacity" => m.queue_capacity.map(|v| v as f64),
+        "dropped_count" => m.dropped_count.map(|v| v as f64),
+        other => panic!("unhandled field {other}"),
+    }
 }

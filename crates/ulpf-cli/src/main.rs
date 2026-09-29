@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
@@ -17,19 +17,21 @@ use tracing_subscriber::EnvFilter;
 use ulpf_ai::drain::{AlertSeverity, AnomalyType};
 use ulpf_ai::evaluator::{load_sidecar_gt, EvaluatorEngine, GtOverrides};
 use ulpf_ai::onboarder::{DynamicParserRegistry, Onboarder};
-use ulpf_ai::pipeline::TieredPipeline;
+use ulpf_ai::pipeline::{PipelineStats, TieredPipeline};
 use ulpf_core::ingest::socket::{
     create_tcp_listener, create_udp_socket, tcp_listener_rcvbuf, udp_socket_rcvbuf,
     INGEST_RCVBUF_BYTES,
 };
 use ulpf_core::ingest::{BackpressurePolicy, LogQueue, MemoryQueue};
 
+use ulpf_core::parser::lru_cache::LruStats;
 use ulpf_core::parser::UniversalParser;
 use ulpf_core::schema::ocsf::NetworkActivity;
 use ulpf_integrity::batcher::{BatchAccumulator, BatcherConfig, IncomingLog};
 use ulpf_integrity::storage::ParquetCompression;
 use ulpf_integrity::tamper::verify_block_with_ledger;
 
+use ulpf_cli::ingest_telemetry::TelemetryPublisher;
 use ulpf_cli::{scorecard, serve};
 
 /// Upper bound on sample lines read by `ulpf onboard`.
@@ -490,6 +492,68 @@ fn resolve_pop_chunk(args: &IngestArgs) -> usize {
     }
 }
 
+/// Aggregate per-worker LRU cache statistics into one pipeline-wide ratio.
+///
+/// Each parse worker owns its own `TieredPipeline` and therefore its own
+/// `SignatureLruCache`, so a hit rate has to be recomputed from summed
+/// hits/misses across workers. Averaging the per-worker ratios would be wrong:
+/// a worker that has seen two events would count as heavily as one that has
+/// seen a million.
+///
+/// Returns `None` when no worker has performed a lookup, so the caller can
+/// report "not measured" instead of `0.0` — which would assert that the cache
+/// never hits, a claim about a system that has not run.
+fn aggregate_lru(slots: &Mutex<Vec<PipelineStats>>) -> Option<(f64, u64)> {
+    let guard = match slots.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut hits = 0u64;
+    let mut total = 0u64;
+    for stats in guard.iter() {
+        hits = hits.saturating_add(stats.lru_stats.hits);
+        total = total.saturating_add(stats.lru_stats.total_lookups);
+    }
+    if total == 0 {
+        return None;
+    }
+    Some((hits as f64 / total as f64, total))
+}
+
+/// Samples retained in the rolling latency window published to the dashboard.
+///
+/// Fixed, not configurable: a window sized from live traffic would change the
+/// meaning of the reported percentiles over time, and an unbounded one would
+/// grow with traffic. 4096 samples describes recent behaviour at line rate
+/// while staying a few tens of kilobytes.
+const LATENCY_WINDOW_SAMPLES: usize = 4096;
+
+/// Neutral per-worker slot before a worker has published real statistics.
+///
+/// `PipelineStats` has no `Default` because an all-zero `lru_stats` would
+/// imply a measured 0% hit rate. This const makes "nothing published yet"
+/// explicit, and `aggregate_lru` returns `None` when every slot is still this.
+const EMPTY_PIPELINE_STATS: PipelineStats = PipelineStats {
+    total_events: 0,
+    tier1_lru_hits: 0,
+    tier2_drain_hits: 0,
+    tier3_laya_dispatches: 0,
+    tier3_laya_onboarded: 0,
+    laya_action_flags: 0,
+    laya_threat_flags: 0,
+    cluster_evictions: 0,
+    triage_evictions: 0,
+    lru_hit_ratio: 0.0,
+    lru_stats: LruStats {
+        hits: 0,
+        misses: 0,
+        evictions: 0,
+        hit_ratio: 0.0,
+        total_lookups: 0,
+        entries_count: 0,
+    },
+};
+
 /// Claim a newly-seen template for alerting. The first worker to observe a
 /// novel shape owns the NewTemplate alert; later workers seeing the same
 /// template treat it as known (returns false) so one new format yields one
@@ -698,6 +762,25 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
         .map(|_| Arc::new(AtomicU64::new(0)))
         .collect();
 
+    // Live telemetry: the only bridge from this process's counters to the
+    // out-of-band serve plane, which cannot see inside the ingest task graph.
+    // The sidecar sits beside the ledger so both planes derive the same path
+    // from the same inputs without either knowing about the other.
+    let telemetry = Arc::new(TelemetryPublisher::new(LATENCY_WINDOW_SAMPLES));
+    let telemetry_path = ulpf_core::ingest::telemetry::default_snapshot_path(&args.ledger);
+    // Per-vendor parsed counts, accumulated by the parse workers. A BTreeMap
+    // behind a lock rather than a sharded atomic per vendor: one uncontended
+    // lock per line is cheaper than the complexity, and this is the same
+    // pattern the NewTemplate dedupe already uses on this path.
+    let vendor_counts: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    // Each parse worker owns its own `TieredPipeline`, so LRU statistics are
+    // per-worker and have to be aggregated to describe the pipeline. Workers
+    // publish into their own slot once per batch (not per line), and the
+    // reporter sums the slots. A per-line shared atomic would put a contended
+    // cache line on the hot path for a number nobody reads at that frequency.
+    let worker_pipeline_stats: Arc<Mutex<Vec<PipelineStats>>> =
+        Arc::new(Mutex::new(vec![EMPTY_PIPELINE_STATS; args.parse_workers]));
+
     // Spawn Stats Reporter
     let total_ing_stats = total_ingested.clone();
     let total_parsed_stats = total_parsed.clone();
@@ -708,6 +791,11 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
     let flush_dropped_stats = flush_dropped.clone();
     let flush_dropped_bytes_stats = flush_dropped_bytes.clone();
     let worker_parsed_stats = worker_parsed.clone();
+    let telemetry_stats = telemetry.clone();
+    let telemetry_path_stats = telemetry_path.clone();
+    let vendor_counts_stats = vendor_counts.clone();
+    let anomalies_stats = total_anomalies.clone();
+    let worker_stats = worker_pipeline_stats.clone();
     // Static capacity gauges for the reporter: queue bound, kernel socket
     // buffers, and the queue's high-water mark (peak depth since startup —
     // the "how close to saturation" number). EPS capacity itself is a
@@ -746,6 +834,36 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
                 "\x1b[32m[ULPF LIVE]\x1b[0m Ingest: \x1b[1;37m{:>7.0} EPS\x1b[0m | Total: \x1b[1;37m{:>8}\x1b[0m | Normalized OCSF: \x1b[1;32m{:>8}\x1b[0m | Blocks Anchored: \x1b[1;35m{:>4}\x1b[0m | Anomalies: \x1b[1;33m{:>3}\x1b[0m | Queue: \x1b[1;37m{:>5}/{} msgs / {:>8} bytes (peak {:>8})\x1b[0m | Dropped: \x1b[1;31m{} ({} bytes)\x1b[0m | Pushed: \x1b[1;37m{}\x1b[0m Blocked: \x1b[1;37m{}\x1b[0m FlushQ: \x1b[1;37m{}/{}\x1b[0m | RcvBuf: \x1b[1;37m{}/{}\x1b[0m | Workers: \x1b[1;37m{}/{}\x1b[0m",
                 eps, current, parsed, blocks, anomalies, qs.current_len, queue_cap, qs.queued_bytes, qs.high_water_bytes, dropped, dropped_bytes, qs.pushed, qs.blocked, flush_depth_stats.load(Ordering::Relaxed), flush_capacity, udp_rcvbuf, tcp_rcvbuf, engaged, worker_parsed_stats.len()
             );
+
+            // Publish the sidecar so the serve plane can report measured
+            // telemetry. Best-effort: a failed write must not kill the
+            // reporter, which is also the operator's console. The snapshot
+            // therefore records `running: true` regardless, and a reader
+            // that stops seeing fresh writes falls back to reporting stale
+            // rather than trusting an old reading.
+            let eps_now = telemetry_stats.observe_ingested(current);
+            let lru_pair = aggregate_lru(&worker_stats);
+            let vendors = match vendor_counts_stats.lock() {
+                Ok(counts) => counts.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            let snapshot = telemetry_stats.snapshot(
+                eps_now,
+                lru_pair,
+                Some(qs.current_len),
+                Some(queue_cap),
+                Some(dropped),
+                Some(current),
+                Some(parsed),
+                Some(blocks), // already cloned as `total_blocks_stats`
+                Some(anomalies_stats.load(Ordering::Relaxed)),
+                vendors,
+            );
+            if let Err(e) =
+                ulpf_core::ingest::telemetry::write_snapshot(&telemetry_path_stats, &snapshot)
+            {
+                tracing::debug!("live telemetry snapshot not written: {e}");
+            }
 
             last_check = now;
             last_count = current;
@@ -852,6 +970,9 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
         let shutdown_w = parse_shutdown.clone();
         let my_parsed_w = my_parsed.clone();
         let emitted_w = emitted_templates.clone();
+        let telemetry_w = telemetry.clone();
+        let vendor_counts_w = vendor_counts.clone();
+        let worker_stats_w = worker_pipeline_stats.clone();
         worker_handles.push(
             std::thread::Builder::new()
                 .name(format!("ulpf-parse-{worker_id}"))
@@ -866,6 +987,12 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
                             std::thread::sleep(Duration::from_millis(1));
                             continue;
                         }
+                        // Publish this worker's pipeline stats into its own
+                        // slot so the reporter can aggregate LRU hit rate
+                        // across workers. Once per batch, not per line.
+                        if let Ok(mut slots) = worker_stats_w.lock() {
+                            slots[worker_id] = pipeline.stats();
+                        }
                         for raw_log in batch {
                             // Borrow the queued bytes in place: the old path
                             // copied every line twice (to_vec, then to_string).
@@ -875,9 +1002,26 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
                             if raw_str.is_empty() {
                                 continue;
                             }
+                            // Time the parse so the dashboard reports a
+                            // measured latency instead of a literal. The
+                            // window is a fixed ring, so this cannot grow
+                            // memory with traffic. Cost is one Instant pair
+                            // and one mutex-guarded f64 store per line.
+                            let parse_started = Instant::now();
                             let (event, anomaly) = pipeline.process_live(raw_str);
+                            telemetry_w
+                                .latency
+                                .record(parse_started.elapsed().as_secs_f64() * 1_000_000.0);
                             parsed_w.fetch_add(1, Ordering::Relaxed);
                             my_parsed_w.fetch_add(1, Ordering::Relaxed);
+                            // Per-vendor counts for the live vendor mix. A
+                            // poisoned lock degrades to skipping the count
+                            // rather than dropping the event.
+                            if let Ok(mut counts) = vendor_counts_w.lock() {
+                                *counts
+                                    .entry(event.metadata.product.vendor_name.clone())
+                                    .or_insert(0) += 1;
+                            }
                             if let Some(alert) = anomaly {
                                 // Dedupe NewTemplate across workers: first
                                 // claimant owns the alert + the count, the rest

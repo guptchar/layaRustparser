@@ -10,14 +10,38 @@ paths:
   /metrics:
     get:
       summary: Live Telemetry & Vendor Mix
-      description: Returns live throughput (EPS), p50/p99 latency percentiles, queue depth, LRU hit rate, vendor mix, and disposition breakdown.
+      description: |
+        Returns measured throughput, latency percentiles, queue depth, LRU hit
+        rate, per-vendor parsed counts, and disposition breakdown.
+
+        **Every value is measured. Unmeasured values are `null`, never `0` and
+        never a placeholder constant.** A consumer must distinguish three
+        states: a measured value, `0` (traffic observed, rate genuinely zero),
+        and `null` (nothing measured). The `telemetry_state` field names the
+        third case explicitly.
+
+        Live gauges come from the ingest process, which publishes a telemetry
+        sidecar next to the ledger; this process cannot observe the ingest task
+        graph directly. `ulpf serve` and `ulpf ingest` are separate processes.
+        When the sidecar is absent or older than the staleness bound, the live
+        gauges report `null` and `telemetry_state` becomes `STALE` or
+        `ABSENT` — a stale reading is never presented as a live one.
       responses:
         '200':
           description: Telemetry data retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricsResponse'
   /alerts:
     get:
       summary: Security & Anomaly Alerts Feed
-      description: Returns list of tamper alarms and Drain structural novelty alerts.
+      description: |
+        Returns alerts derived from real events only — currently tamper alarms
+        from block verification against the Merkle ledger.
+
+        The feed is empty when nothing has actually happened. It is never
+        populated with synthetic entries to make a demo look busy.
       responses:
         '200':
           description: List of active alerts
@@ -205,3 +229,128 @@ paths:
       responses:
         '200':
           description: System status retrieved
+
+components:
+  schemas:
+    MetricsResponse:
+      type: object
+      description: |
+        Measured pipeline telemetry. Fields that could not be measured are
+        `null`; they are never defaulted to `0` or to a plausible constant.
+      properties:
+        eps:
+          type: number
+          format: double
+          nullable: true
+          description: |
+            Measured events per second. `null` when no traffic has been
+            observed. Note `0` and `null` differ: `0` means traffic was
+            observed and the rate was genuinely zero.
+        latency_p50_micros:
+          type: number
+          format: double
+          nullable: true
+          description: Median per-line parse latency over the rolling window.
+        latency_p99_micros:
+          type: number
+          format: double
+          nullable: true
+          description: 99th percentile of the same rolling window.
+        latency_samples:
+          type: integer
+          format: int64
+          description: |
+            Samples currently behind the latency window, so the percentiles can
+            be judged representative or not.
+        lru_hit_rate:
+          type: number
+          format: double
+          nullable: true
+          description: |
+            Parser signature-cache hit ratio, aggregated across parse workers
+            from summed hits and lookups. `null` until at least one lookup has
+            occurred.
+        lru_lookups:
+          type: integer
+          format: int64
+          nullable: true
+          description: Lookups behind `lru_hit_rate`, so the ratio is auditable.
+        queue_depth:
+          type: integer
+          nullable: true
+          description: Messages queued in the bounded ingest queue.
+        queue_capacity:
+          type: integer
+          nullable: true
+          description: Configured bound on `queue_depth`.
+        dropped_count:
+          type: integer
+          format: int64
+          nullable: true
+          description: Cumulative lines shed by the drop-newest policy.
+        total_ingested:
+          type: integer
+          format: int64
+          nullable: true
+        total_parsed:
+          type: integer
+          format: int64
+          nullable: true
+        total_blocks:
+          type: integer
+          format: int64
+          nullable: true
+          description: Merkle blocks anchored, from the persisted ledger.
+        total_anomalies:
+          type: integer
+          format: int64
+          nullable: true
+        vendor_mix:
+          type: object
+          additionalProperties:
+            type: integer
+            format: int64
+          description: |
+            Per-vendor parsed **counts** from the live event stream, not
+            percentages — a percentage with no stated base is misleading. An
+            empty object means no vendor has been parsed by the running ingest
+            process. It is never back-filled with a placeholder distribution.
+        disposition_breakdown:
+          type: object
+          additionalProperties:
+            type: integer
+            format: int64
+          description: |
+            Disposition counts over a bounded sample of the persisted corpus.
+            Only dispositions actually present appear; an empty corpus yields
+            an empty object rather than zeroed placeholders.
+        disposition_sampled:
+          type: integer
+          format: int64
+          description: Records behind `disposition_breakdown`, so its base is known.
+        telemetry_state:
+          type: string
+          enum: [LIVE, STALE, ABSENT]
+          description: |
+            Whether the live gauges are current.
+            * `LIVE` — fresh snapshot from a running ingest process.
+            * `STALE` — a snapshot exists but is older than the staleness bound,
+              or its writer exited.
+            * `ABSENT` — ingest has never run; there is nothing to report.
+        telemetry_age_ms:
+          type: integer
+          format: int64
+          nullable: true
+          description: Age of the underlying snapshot, or `null` when absent.
+        disposition_source:
+          type: string
+          description: Provenance of the disposition counts, so their base is explicit.
+        status:
+          type: string
+          enum: [HEALTHY, DEGRADED, IDLE, UNKNOWN]
+          description: |
+            Pipeline health derived from real signals, never a constant.
+            `HEALTHY`/`DEGRADED` require live telemetry with a measured drop
+            count. `IDLE` means a live pipeline stopped publishing. `UNKNOWN`
+            means live telemetry is unavailable — including when ingest has
+            never run, which is deliberately **not** reported as healthy.

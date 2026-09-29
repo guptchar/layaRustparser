@@ -1,25 +1,27 @@
 {
-  "eps": 142500.0,
-  "latency_p50_micros": 1.28,
-  "latency_p99_micros": 4.12,
-  "queue_depth": 0,
-  "queue_capacity": 50000,
-  "dropped_count": 0,
-  "lru_hit_rate": 0.962,
-  "total_ingested": 25000,
-  "total_parsed": 25000,
-  "total_blocks": 25,
-  "vendor_mix": {
-    "cisco_asa": 32.5,
-    "fortigate": 28.0,
-    "paloalto": 21.5,
-    "pfsense": 12.0,
-    "suricata": 6.0
-  },
+  "eps": null,
+  "latency_p50_micros": null,
+  "latency_p99_micros": null,
+  "latency_samples": 0,
+  "lru_hit_rate": null,
+  "lru_lookups": null,
+  "queue_depth": null,
+  "queue_capacity": null,
+  "dropped_count": null,
+  "total_ingested": 50000,
+  "total_parsed": null,
+  "total_blocks": 50,
+  "total_anomalies": null,
+  "vendor_mix": {},
   "disposition_breakdown": {
-    "Allowed": 18240,
-    "Blocked": 5610,
-    "Dropped": 1150
+    "Blocked": 264,
+    "Allowed": 1115,
+    "Dropped": 196,
+    "Unknown": 425
   },
-  "status": "HEALTHY"
+  "disposition_sampled": 2000,
+  "telemetry_state": "ABSENT",
+  "telemetry_age_ms": null,
+  "disposition_source": "persisted_parquet_sample",
+  "status": "UNKNOWN"
 }
