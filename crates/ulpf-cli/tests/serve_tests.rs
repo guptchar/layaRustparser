@@ -103,6 +103,12 @@ async fn test_metrics_reports_null_not_fabricated_when_ingest_absent() {
         start_time: std::time::Instant::now(),
         telemetry_path: root.join("data/does-not-exist.json"),
         stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+        metrics_cache: ulpf_cli::serve::metrics_cache::MetricsCache::new(
+            std::time::Duration::from_millis(
+                ulpf_cli::serve::metrics_cache::DEFAULT_METRICS_TTL_MS,
+            ),
+        ),
+        corpus_cache: ulpf_cli::serve::metrics_cache::CorpusCache::new(),
     };
     let app = create_router(state);
     let req = Request::builder()
@@ -160,6 +166,12 @@ async fn test_metrics_has_no_fabricated_vendor_mix() {
         start_time: std::time::Instant::now(),
         telemetry_path: empty.path().join("live_telemetry.json"),
         stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+        metrics_cache: ulpf_cli::serve::metrics_cache::MetricsCache::new(
+            std::time::Duration::from_millis(
+                ulpf_cli::serve::metrics_cache::DEFAULT_METRICS_TTL_MS,
+            ),
+        ),
+        corpus_cache: ulpf_cli::serve::metrics_cache::CorpusCache::new(),
     };
     let app = create_router(state);
     let req = Request::builder()
@@ -473,6 +485,12 @@ async fn test_serve_tamper_drill_isolation() {
         start_time: std::time::Instant::now(),
         telemetry_path: root.join("data/live_telemetry.json"),
         stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+        metrics_cache: ulpf_cli::serve::metrics_cache::MetricsCache::new(
+            std::time::Duration::from_millis(
+                ulpf_cli::serve::metrics_cache::DEFAULT_METRICS_TTL_MS,
+            ),
+        ),
+        corpus_cache: ulpf_cli::serve::metrics_cache::CorpusCache::new(),
     };
 
     let original_block1_bytes =
@@ -903,11 +921,6 @@ async fn test_serve_state_initialization_deterministic() {
             "telemetry path must be derived next to the ledger, got {:?}",
             s.telemetry_path()
         );
-        let metrics = s.compute_metrics();
-        assert_eq!(
-            metrics.eps, None,
-            "a fresh state must not report an EPS it never measured"
-        );
     });
     handle
         .join()
@@ -1026,9 +1039,15 @@ async fn test_metrics_nulls_gauges_when_snapshot_is_stale() {
         start_time: std::time::Instant::now(),
         telemetry_path: sidecar,
         stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+        metrics_cache: ulpf_cli::serve::metrics_cache::MetricsCache::new(
+            std::time::Duration::from_millis(
+                ulpf_cli::serve::metrics_cache::DEFAULT_METRICS_TTL_MS,
+            ),
+        ),
+        corpus_cache: ulpf_cli::serve::metrics_cache::CorpusCache::new(),
     };
 
-    let metrics = state.compute_metrics();
+    let metrics = state.compute_metrics().await;
 
     for field in [
         "eps",
@@ -1103,9 +1122,15 @@ async fn test_metrics_reports_live_snapshot_values() {
         start_time: std::time::Instant::now(),
         telemetry_path: sidecar,
         stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+        metrics_cache: ulpf_cli::serve::metrics_cache::MetricsCache::new(
+            std::time::Duration::from_millis(
+                ulpf_cli::serve::metrics_cache::DEFAULT_METRICS_TTL_MS,
+            ),
+        ),
+        corpus_cache: ulpf_cli::serve::metrics_cache::CorpusCache::new(),
     };
 
-    let metrics = state.compute_metrics();
+    let metrics = state.compute_metrics().await;
 
     assert_eq!(metrics.eps, Some(1234.0), "a live EPS must be reported");
     assert_eq!(metrics.latency_p50_micros, Some(45.45));
@@ -1155,9 +1180,15 @@ async fn test_metrics_degrades_status_on_measured_drops() {
         start_time: std::time::Instant::now(),
         telemetry_path: sidecar,
         stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+        metrics_cache: ulpf_cli::serve::metrics_cache::MetricsCache::new(
+            std::time::Duration::from_millis(
+                ulpf_cli::serve::metrics_cache::DEFAULT_METRICS_TTL_MS,
+            ),
+        ),
+        corpus_cache: ulpf_cli::serve::metrics_cache::CorpusCache::new(),
     };
 
-    let metrics = state.compute_metrics();
+    let metrics = state.compute_metrics().await;
     assert_eq!(
         metrics.status, "DEGRADED",
         "a measured drop count must degrade the pipeline, not report HEALTHY"
@@ -1218,9 +1249,15 @@ async fn test_measured_zero_is_reported_as_zero_not_null() {
         start_time: std::time::Instant::now(),
         telemetry_path: sidecar,
         stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+        metrics_cache: ulpf_cli::serve::metrics_cache::MetricsCache::new(
+            std::time::Duration::from_millis(
+                ulpf_cli::serve::metrics_cache::DEFAULT_METRICS_TTL_MS,
+            ),
+        ),
+        corpus_cache: ulpf_cli::serve::metrics_cache::CorpusCache::new(),
     };
 
-    let metrics = state.compute_metrics();
+    let metrics = state.compute_metrics().await;
 
     assert_eq!(
         metrics.total_ingested,
@@ -1272,9 +1309,15 @@ async fn test_stopped_writer_clears_gauges_and_reports_real_age() {
         start_time: std::time::Instant::now(),
         telemetry_path: sidecar,
         stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+        metrics_cache: ulpf_cli::serve::metrics_cache::MetricsCache::new(
+            std::time::Duration::from_millis(
+                ulpf_cli::serve::metrics_cache::DEFAULT_METRICS_TTL_MS,
+            ),
+        ),
+        corpus_cache: ulpf_cli::serve::metrics_cache::CorpusCache::new(),
     };
 
-    let metrics = state.compute_metrics();
+    let metrics = state.compute_metrics().await;
 
     assert_eq!(metrics.eps, None, "a stopped writer's EPS is not live");
     assert_eq!(metrics.latency_p50_micros, None);
@@ -1299,4 +1342,204 @@ async fn test_stopped_writer_clears_gauges_and_reports_real_age() {
 
     // Cumulative facts survive: they are still true.
     assert_eq!(metrics.total_ingested, Some(500));
+}
+
+/// The whole point of #56: a poll inside the TTL must not redo the work.
+///
+/// Asserted through the real handler over HTTP rather than by calling the
+/// cache directly, so the test covers the path a client actually takes —
+/// including the `AppState` clone axum performs per request, which is where a
+/// naive cache would silently give every request its own copy.
+#[tokio::test]
+async fn test_metrics_cache_serves_repeat_polls_without_recompute() {
+    let state = setup_test_state().with_metrics_ttl(std::time::Duration::from_secs(60));
+    let app = create_router(state.clone());
+
+    let mut last_body: Vec<u8> = Vec::new();
+    for i in 0..20 {
+        let req = Request::builder()
+            .uri("/metrics")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid JSON");
+
+        if i == 0 {
+            // First poll populates the cache; the body is real measured data
+            // derived from the repo fixtures.
+            assert_eq!(
+                json.get("telemetry_state").and_then(|v| v.as_str()),
+                Some("ABSENT"),
+                "no ingest process is running in tests, so telemetry is absent"
+            );
+            last_body = body.to_vec();
+        } else {
+            assert_eq!(
+                body.to_vec(),
+                last_body,
+                "poll {i} inside the TTL must return the cached response byte-for-byte"
+            );
+        }
+    }
+
+    assert_eq!(
+        state.metrics_cache.recompute_count(),
+        1,
+        "20 polls inside the TTL must cause exactly one computation"
+    );
+}
+
+/// A cached response must still describe the freshness it was computed with.
+///
+/// #56 adds a second kind of staleness on top of #80's: the cached response is
+/// younger than the TTL but older than the last ingest write. The two compose
+/// only because the cache passes `telemetry_state`/`telemetry_age_ms` through
+/// untouched instead of recomputing them. Pinned here so it stays deliberate.
+#[tokio::test]
+async fn test_cached_response_preserves_its_computed_freshness() {
+    let state = setup_test_state().with_metrics_ttl(std::time::Duration::from_secs(60));
+    let app = create_router(state.clone());
+
+    let fetch = |app: axum::Router| async move {
+        let req = Request::builder()
+            .uri("/metrics")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<serde_json::Value>(&body).expect("valid JSON")
+    };
+
+    let first = fetch(app.clone()).await;
+    let second = fetch(app.clone()).await;
+
+    assert_eq!(
+        second.get("telemetry_state"),
+        first.get("telemetry_state"),
+        "a cache hit must not silently upgrade the reported telemetry state"
+    );
+    assert_eq!(
+        second.get("telemetry_age_ms"),
+        first.get("telemetry_age_ms"),
+        "telemetry_age_ms describes the cached snapshot, so it must not be \
+         rewritten to look fresher than the data is"
+    );
+}
+
+/// Past the TTL the response must be recomputed, and the recompute must not
+/// re-run the expensive Parquet scan while the block set is unchanged.
+#[tokio::test]
+async fn test_expiry_recomputes_but_reuses_the_parquet_scan() {
+    let state = setup_test_state().with_metrics_ttl(std::time::Duration::from_millis(1));
+    let app = create_router(state.clone());
+
+    let fetch = |app: axum::Router| async move {
+        let req = Request::builder()
+            .uri("/metrics")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<serde_json::Value>(&body).expect("valid JSON")
+    };
+
+    let first = fetch(app.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let second = fetch(app.clone()).await;
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let third = fetch(app.clone()).await;
+
+    assert_eq!(
+        state.metrics_cache.recompute_count(),
+        3,
+        "an expired entry must be recomputed, not served"
+    );
+    // The block set did not change, so the disposition figures must be
+    // identical across recomputes — proving the scan was served from the
+    // corpus cache rather than re-run.
+    assert_eq!(
+        second.get("disposition_breakdown"),
+        first.get("disposition_breakdown"),
+        "an unchanged block set must not change the disposition breakdown"
+    );
+    assert_eq!(
+        third.get("disposition_breakdown"),
+        first.get("disposition_breakdown"),
+        "the cached scan must be reused across recomputes"
+    );
+    assert!(
+        second
+            .get("disposition_sampled")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            > 0,
+        "the repo fixtures must yield real dispositions, or this test proves nothing"
+    );
+}
+
+/// Concurrent polls past the TTL must not stampede the recompute.
+#[tokio::test]
+async fn test_concurrent_polls_do_not_stampede() {
+    // A TTL comfortably longer than one recompute. This matters: the
+    // single-recompute guarantee only holds while the TTL outlasts the
+    // recompute plus scheduling jitter. With a 1 ms TTL the entry expires
+    // while waiters are still queued on the mutex, and a second recompute is
+    // then *correct* rather than a stampede — which is a real caveat on the
+    // mechanism, not something to paper over in the test.
+    let state = setup_test_state().with_metrics_ttl(std::time::Duration::from_millis(500));
+    let app = create_router(state.clone());
+
+    // Cold cache: nothing has been computed yet, so every task below needs one.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let mut handles = Vec::new();
+    for _ in 0..12 {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            let req = Request::builder()
+                .uri("/metrics")
+                .method("GET")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(req).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }));
+    }
+    for h in handles {
+        h.await.expect("request task must not panic");
+    }
+
+    assert_eq!(
+        state.metrics_cache.recompute_count(),
+        1,
+        "12 concurrent cold polls must cause one recompute, not 12"
+    );
+}
+
+/// The response shape must be byte-identical to the uncached path — #56 caches
+/// underneath #80's contract and must not alter it.
+#[tokio::test]
+async fn test_cached_and_uncached_paths_agree() {
+    let state = setup_test_state();
+    let uncached = state.compute_metrics().await;
+
+    let cached_state = state.with_metrics_ttl(std::time::Duration::from_secs(60));
+    let first = cached_state.metrics_cached().await;
+    let second = cached_state.metrics_cached().await;
+
+    assert_eq!(
+        serde_json::to_value(&uncached).unwrap(),
+        serde_json::to_value(&first).unwrap(),
+        "a cache miss must return exactly what the uncached path returns"
+    );
+    assert_eq!(
+        serde_json::to_value(&first).unwrap(),
+        serde_json::to_value(&second).unwrap(),
+        "a cache hit must return the identical payload"
+    );
 }

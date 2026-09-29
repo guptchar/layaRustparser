@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -14,6 +14,10 @@ use ulpf_core::ingest::telemetry::{
 use ulpf_integrity::batcher::BatchAccumulator;
 use ulpf_integrity::storage::read_parquet_file;
 use ulpf_integrity::tamper::verify_block_with_ledger;
+
+use crate::serve::metrics_cache::{
+    fingerprint_ledger, CorpusAggregates, CorpusCache, MetricsCache, DEFAULT_METRICS_TTL_MS,
+};
 
 /// A security or system alert presented to the SOC feed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -134,6 +138,11 @@ pub struct AppState {
     pub telemetry_path: PathBuf,
     /// Staleness bound applied to the snapshot before reporting its gauges.
     pub stale_after_ms: u64,
+    /// Whole-response TTL cache. See `serve::metrics_cache` for why the TTL
+    /// and the corpus cache are separate layers.
+    pub metrics_cache: MetricsCache<MetricsResponse>,
+    /// Block-set-keyed cache for the expensive Parquet scan.
+    pub corpus_cache: CorpusCache,
 }
 
 impl AppState {
@@ -187,6 +196,8 @@ impl AppState {
             start_time: Instant::now(),
             telemetry_path,
             stale_after_ms: DEFAULT_STALE_AFTER_MS,
+            metrics_cache: MetricsCache::new(Duration::from_millis(DEFAULT_METRICS_TTL_MS)),
+            corpus_cache: CorpusCache::new(),
         }
     }
 
@@ -201,6 +212,33 @@ impl AppState {
     /// Where this state reads live telemetry from.
     pub fn telemetry_path(&self) -> &Path {
         &self.telemetry_path
+    }
+
+    /// Override the whole-response TTL. Tests use this to make expiry
+    /// deterministic instead of sleeping.
+    pub fn with_metrics_ttl(mut self, ttl: Duration) -> Self {
+        self.metrics_cache = MetricsCache::new(ttl);
+        self
+    }
+
+    /// Cached metrics for `GET /metrics`.
+    ///
+    /// Returns the previous response unchanged while it is inside the TTL,
+    /// performing no I/O at all. Past the TTL it recomputes under a mutex, so
+    /// concurrent polls produce one recompute rather than N.
+    ///
+    /// A cached response is returned with the `telemetry_state` and
+    /// `telemetry_age_ms` it was computed with. That is deliberate: those
+    /// fields describe the freshness of the underlying snapshot as of the
+    /// last recompute, and rewriting them on a cache hit would mean reporting
+    /// a freshness the cached data does not have.
+    pub async fn metrics_cached(&self) -> MetricsResponse {
+        if let Some(hit) = self.metrics_cache.get_fresh().await {
+            return hit;
+        }
+        self.metrics_cache
+            .refresh(|| self.compute_metrics_with_corpus_cache())
+            .await
     }
 
     /// Scan available blocks for real alerts.
@@ -284,10 +322,60 @@ impl AppState {
     ///   is absent or stale they report `null`.
     /// * **Persisted corpus counts** (blocks, dispositions) come from the
     ///   ledger and Parquet, which outlive any single process.
-    pub fn compute_metrics(&self) -> MetricsResponse {
+    pub async fn compute_metrics(&self) -> MetricsResponse {
         let (total_blocks, ledger_ingested) = self.read_ledger_totals();
         let (disposition_breakdown, disposition_sampled) = self.read_dispositions();
+        self.assemble_metrics(
+            total_blocks,
+            ledger_ingested,
+            disposition_breakdown,
+            disposition_sampled,
+        )
+    }
 
+    /// `compute_metrics` with the expensive Parquet scan served from the
+    /// block-set cache.
+    ///
+    /// The ledger fingerprint is read once per recompute — one `stat`, not a
+    /// parse — and only a changed block set re-runs the scan. This is what
+    /// keeps the TTL from degrading into "re-decode 5,000 Parquet rows every
+    /// second", which is what the TTL would otherwise mean.
+    async fn compute_metrics_with_corpus_cache(&self) -> MetricsResponse {
+        let fingerprint = fingerprint_ledger(&self.ledger_path);
+        let cached = self.corpus_cache.get(fingerprint).await;
+        let aggregates = match cached {
+            Some(hit) => hit,
+            None => {
+                let (breakdown, sampled) = self.read_dispositions();
+                let fresh = CorpusAggregates {
+                    disposition_breakdown: breakdown,
+                    disposition_sampled: sampled,
+                };
+                self.corpus_cache.put(fingerprint, fresh.clone()).await;
+                fresh
+            }
+        };
+        // The ledger totals are cheap enough to re-read each recompute (the
+        // corpus cache above removed the expensive part, and a ledger parse is
+        // bounded by what a single run has anchored).
+        let (total_blocks, ledger_ingested) = self.read_ledger_totals();
+        self.assemble_metrics(
+            total_blocks,
+            ledger_ingested,
+            aggregates.disposition_breakdown,
+            aggregates.disposition_sampled,
+        )
+    }
+
+    /// Build the response from already-gathered inputs.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble_metrics(
+        &self,
+        total_blocks: u64,
+        ledger_ingested: u64,
+        disposition_breakdown: HashMap<String, u64>,
+        disposition_sampled: u64,
+    ) -> MetricsResponse {
         let live = self.read_live_telemetry();
         let (telemetry_state, telemetry_age_ms, gauge) = match &live {
             None => (TelemetryState::Absent, None, IngestSnapshot::default()),

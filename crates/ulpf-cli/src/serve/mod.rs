@@ -1,4 +1,5 @@
 pub mod handlers;
+pub mod metrics_cache;
 pub mod state;
 
 use std::net::SocketAddr;

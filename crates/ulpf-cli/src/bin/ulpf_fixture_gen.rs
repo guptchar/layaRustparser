@@ -18,7 +18,8 @@ fn repo_root() -> PathBuf {
         .expect("canonicalize repo root")
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let root = repo_root();
     let state = AppState::new(
         root.join("data/parquet"),
@@ -28,7 +29,7 @@ fn main() {
     );
 
     let metrics =
-        serde_json::to_string_pretty(&state.compute_metrics()).expect("serialize metrics");
+        serde_json::to_string_pretty(&state.compute_metrics().await).expect("serialize metrics");
     std::fs::write(
         root.join("data/fixtures/api/metrics.json"),
         format!("{metrics}\n"),

@@ -245,7 +245,7 @@ pub struct SystemResponse {
 
 /// GET /metrics
 pub async fn get_metrics(State(state): State<AppState>) -> Json<MetricsResponse> {
-    Json(state.compute_metrics())
+    Json(state.metrics_cached().await)
 }
 
 /// GET /alerts
