@@ -29,7 +29,7 @@ New here? Ask questions about the codebase in plain English on our [DeepWiki](ht
 - **Action inviolability enforced on anchor tokens.** `ALLOW`/`PERMIT`/`ACCEPT` can never land in the same template cluster as `DENY`/`DROP`/`BLOCK`/`REJECT`; corpus-wide disposition purity is measured strictly in the [duel report](docs/benchmarks/eval_duel_report.md).
 - **Beats vanilla Drain 4–0.** The committed [duel](docs/benchmarks/eval_duel_report.md) runs both engines over probe, fuzzed, BGL and Thunderbird rounds; 3-tier wins grouping accuracy on **all four** (e.g. 98.41% vs 71.73% on fuzzed input).
 - **4,312× template compression.** 224,657 lines collapse to **32** Drain templates (baseline: 137,986) with template accuracy still at 100% — a ready-made feature table for any SIEM/ML system.
-- **Air-gapped for real.** Zero outbound calls, no telemetry, no model downloads. One static **15.9 MB** binary (requirement: < 35 MB), plus Docker.
+- **Air-gapped for real.** Zero outbound calls, no telemetry, no model downloads. One **15.9 MB** release binary (requirement: < 35 MB), plus Docker.
 
 Every accuracy number links to a timestamped report from `ulpf evaluate`, and every table regenerates with one command (see [Reproduce the proof](#reproduce-the-proof)).
 
@@ -144,7 +144,7 @@ cargo test --workspace --no-fail-fast
 | g | Efficient SIEM and Data Lake integration | yes | Parquet WORM blocks, queryable via DuckDB/pandas ([snippet](#data-locations--programmatic-access)) |
 | h | AI/ML-ready security and operational analytics | yes | **32 Drain templates from 224,657 lines (4,312× compression)** — pre-clustered feature IDs ([scorecards](docs/SCORECARDS.md)) |
 | i | Reduced parser development effort | yes | sample file → parser spec in **ms**, not days (quick start 7, [`docs/ONBOARDING_RUNBOOK.md`](docs/ONBOARDING_RUNBOOK.md)) |
-| j | Deployable in an air-gapped network | yes | single self-contained binaries, **zero** outbound calls anywhere in the runtime path |
+| j | Deployable in an air-gapped network | yes | single binary with **zero** outbound calls anywhere in the runtime path. Dynamically linked against glibc (`libc`, `libm`, `libgcc_s`) — not a static build; a fully static musl build is not implemented ([#45](https://github.com/guptchar/layaRustparser/issues/45)) |
 | k | Packaged in a container for platform independence (target < 35 MB) | partial | binary **15.9 MB measured**, inside the 35 MB target; **image size is not measured and is known to be over target** — the current `debian:bookworm-slim` base alone exceeds 35 MB before any of our code. Reaching the target needs a static musl build on `distroless/static`; see [#45](https://github.com/guptchar/layaRustparser/issues/45) for the size budget |
 
 Canonical verdicts with design, code, tests, and measured rows: [`docs/SRS.md`](docs/SRS.md). (The older tables in [`docs/archive/SIH_EVALUATION_DOSSIER.md`](docs/archive/SIH_EVALUATION_DOSSIER.md) §4 and [`docs/ARCHITECTURE_FINAL.md`](docs/ARCHITECTURE_FINAL.md) §4 are superseded/corrected to match it.)
