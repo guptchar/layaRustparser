@@ -121,6 +121,57 @@ pub fn tcp_listener_rcvbuf(listener: &TcpListener) -> io::Result<usize> {
 /// parser stall in the queue rather than by shedding.
 const RAW_BATCH_CHANNEL: usize = 8;
 
+/// Aborts a spawned task on drop, but lets a caller await it first.
+///
+/// Used for the receive task inside [`UdpSyslogListener::run_parsed`]. The
+/// `JoinHandle` has to be retained so a normal exit can await the task and
+/// surface its error; without a drop guard, every early return would detach
+/// a task still parked in `recv_from`, holding the bound socket open for the
+/// life of the process.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl AbortOnDrop<anyhow::Result<()>> {
+    /// Await the task, propagating a panic as an error.
+    ///
+    /// Takes `&mut self` rather than `self`: the type implements `Drop`, so
+    /// the handle cannot be moved out. Taking the inner `Option` leaves the
+    /// drop guard inert afterwards, so the task is never aborted after being
+    /// properly awaited.
+    ///
+    /// Only valid once the task is known to have finished. For a task still
+    /// parked in `recv_from` this would block forever — call
+    /// [`AbortOnDrop::abort`] first, which is why the early-exit path below
+    /// does exactly that.
+    async fn finish(&mut self) -> anyhow::Result<()> {
+        match self.0.take() {
+            Some(handle) => match handle.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(e) if e.is_panic() => Err(anyhow::anyhow!("receive task panicked: {e}")),
+                // Aborted: the loop below decided to stop. Not a failure.
+                Err(_) => Ok(()),
+            },
+            None => Ok(()),
+        }
+    }
+
+    /// Stop the task now, so a subsequent [`AbortOnDrop::finish`] can join it
+    /// instead of waiting on a recv that will never return.
+    fn abort(&mut self) {
+        if let Some(handle) = self.0.as_ref() {
+            handle.abort();
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.as_ref() {
+            handle.abort();
+        }
+    }
+}
+
 /// Point-in-time view of a [`BatchSender`] handoff channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ChannelStats {
@@ -233,6 +284,12 @@ impl<T: Send + 'static> BatchSender<T> {
     /// An independent handle for polling counters from elsewhere.
     pub fn stats(&self) -> BatchChannelStats {
         self.stats.clone()
+    }
+
+    /// Resolves once the consumer is gone, so a producer can shut down
+    /// promptly instead of waiting for its next batch to fail to send.
+    pub async fn closed(&self) {
+        self.tx.closed().await
     }
 
     /// Empty batch buffer sized for the next flush, avoiding a realloc on
@@ -361,11 +418,38 @@ impl UdpSyslogListener {
         let (raw_tx, mut raw_rx) = mpsc::channel::<Vec<Bytes>>(RAW_BATCH_CHANNEL);
         let raw_sink = BatchSender::with_stats(raw_tx, self.config.batch_size, recv_stats);
 
-        tokio::spawn(async move {
-            let _ = self.run_raw(raw_sink).await;
-        });
+        // Hold the receive task's handle rather than detaching it. If the
+        // output consumer goes away, the loop below breaks early and this
+        // method returns while the receive task is still blocked in
+        // `recv_from`, holding the bound socket open. Detaching would strand
+        // it for the life of the process. The guard aborts on drop, so every
+        // exit path below tears the task down.
+        let mut raw_task = AbortOnDrop(Some(tokio::spawn(
+            async move { self.run_raw(raw_sink).await },
+        )));
 
-        while let Some(raw_batch) = raw_rx.recv().await {
+        loop {
+            // Race the next batch against the consumer disappearing. Without
+            // the `closed()` arm, a vanished consumer is only noticed when the
+            // *next* batch fails to send — so on a quiet socket this task
+            // would sit in `recv()` forever, holding the receive task and its
+            // bound socket for the life of the process.
+            let raw_batch = tokio::select! {
+                batch = raw_rx.recv() => match batch {
+                    Some(batch) => batch,
+                    // Receive side ended on its own.
+                    None => break,
+                },
+                _ = sink.closed() => {
+                    // Consumer is gone: nothing downstream can receive output.
+                    // Stop the receive task explicitly — it is parked in
+                    // `recv_from` and will never return on its own, so
+                    // awaiting it without aborting first would hang here.
+                    raw_task.abort();
+                    break;
+                }
+            };
+
             let mut parsed_batch = Vec::with_capacity(raw_batch.len());
             for raw_line in raw_batch {
                 // These bytes were validated as UTF-8 when the datagram was
@@ -376,11 +460,18 @@ impl UdpSyslogListener {
                 }
             }
             if !sink.send_batch(parsed_batch) {
+                // Consumer vanished between the select and now. Same deadlock
+                // as the `closed()` arm: abort before awaiting.
+                raw_task.abort();
                 break;
             }
         }
 
-        Ok(())
+        // `recv()` returned `None`, so the receive task has already dropped
+        // its sender and finished on its own. Await it to surface a genuine
+        // receive-side error rather than swallowing it. If the loop broke
+        // early because the consumer vanished, the guard aborts instead.
+        raw_task.finish().await
     }
 
     /// Shared UDP recv loop: decode each datagram into a batch of [`Bytes`]
@@ -954,6 +1045,56 @@ mod tests {
             stats.counters().dropped_batches,
             0,
             "shutdown is not shed loss and must not be counted as such"
+        );
+    }
+
+    /// The receive task must not be detached. If the output consumer goes
+    /// away, `run_parsed` breaks out of its loop while the receive task is
+    /// still parked in `recv_from` holding the bound socket. Without the
+    /// abort-on-drop guard that task would be stranded for the life of the
+    /// process.
+    ///
+    /// This asserts the method actually returns when the consumer vanishes —
+    /// which it cannot do while holding a live `recv()` on the receive task,
+    /// since the guard is what breaks that coupling.
+    #[tokio::test]
+    async fn test_run_parsed_returns_when_consumer_vanishes() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut config = IngestConfig::default();
+        config.bind_addr = addr;
+        config.batch_size = 1;
+        config.batch_timeout = Duration::from_millis(5);
+
+        let listener = UdpSyslogListener::bind(config).unwrap();
+        let actual_addr = listener.local_addr().unwrap();
+
+        let (tx, rx) = mpsc::channel(1);
+        let sink = BatchSender::new(tx, 1);
+        let parser = Arc::new(UniversalParser::new());
+
+        let server = tokio::spawn(async move {
+            listener
+                .run_parsed(parser, sink, BatchChannelStats::default())
+                .await
+        });
+
+        // Push one batch through so the parser has something to do.
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let line = "%ASA-6-302013: Built inbound UDP connection 123 for outside:1.1.1.1/53 to inside:2.2.2.2/53\n";
+        let _ = sender.send_to(line.as_bytes(), actual_addr).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Consumer disappears. `run_parsed` must notice via the closed output
+        // channel, break, and tear down its receive task.
+        drop(rx);
+
+        let joined = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("run_parsed must return after the consumer vanishes")
+            .expect("task must not panic");
+        assert!(
+            joined.is_ok(),
+            "clean early exit should not report an error, got: {joined:?}"
         );
     }
 }
