@@ -2,7 +2,7 @@ use bytes::Bytes;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -199,6 +199,17 @@ struct BatchChannelCounters {
     sent_lines: AtomicU64,
     dropped_batches: AtomicU64,
     dropped_lines: AtomicU64,
+    /// Batches currently in the channel.
+    ///
+    /// Tracked explicitly rather than read back from the `mpsc::Sender`.
+    /// Holding a sender clone to query `capacity()` would keep the channel
+    /// open: `Receiver::recv` would never observe the sender count reaching
+    /// zero, so the recv loops would spin forever instead of terminating.
+    /// The producer increments on a successful send and the consumer
+    /// decrements via [`BatchSender::record_received`].
+    depth: AtomicUsize,
+    /// Channel capacity in batches, recorded when the sender is built.
+    capacity: AtomicUsize,
 }
 
 impl BatchChannelStats {
@@ -214,14 +225,26 @@ impl BatchChannelStats {
             .fetch_add(lines as u64, Ordering::Relaxed);
     }
 
-    /// Counters only, without the live depth/capacity gauges.
+    /// Note that the consumer took `batches` batches off the channel.
+    ///
+    /// Callers draining a [`BatchSender`]'s channel must call this so the
+    /// reported `depth` gauge stays honest — it is tracked explicitly rather
+    /// than read back from the sender, because holding a sender clone to
+    /// query it would stop `Receiver::recv` from ever seeing the sender count
+    /// reach zero and the recv loops would never terminate.
+    pub fn record_received(&self, batches: usize) {
+        self.0.depth.fetch_sub(batches, Ordering::Relaxed);
+    }
+
+    /// Live gauges plus cumulative counters.
     pub fn counters(&self) -> ChannelStats {
         ChannelStats {
             sent_batches: self.0.sent_batches.load(Ordering::Relaxed),
             sent_lines: self.0.sent_lines.load(Ordering::Relaxed),
             dropped_batches: self.0.dropped_batches.load(Ordering::Relaxed),
             dropped_lines: self.0.dropped_lines.load(Ordering::Relaxed),
-            ..ChannelStats::default()
+            depth: self.0.depth.load(Ordering::Relaxed),
+            capacity: self.0.capacity.load(Ordering::Relaxed),
         }
     }
 }
@@ -274,6 +297,15 @@ impl<T: Send + 'static> BatchSender<T> {
         batch_size: usize,
         stats: BatchChannelStats,
     ) -> Self {
+        // Capacity is fixed at construction, so record it once. `store` rather
+        // than `fetch_max`: a handle may be shared across senders, and the
+        // first writer holds the authoritative value.
+        let capacity = tx.max_capacity();
+        let _ =
+            stats
+                .0
+                .capacity
+                .compare_exchange(0, capacity, Ordering::Relaxed, Ordering::Relaxed);
         Self {
             tx,
             batch_size,
@@ -308,6 +340,7 @@ impl<T: Send + 'static> BatchSender<T> {
         match self.tx.try_send(batch) {
             Ok(()) => {
                 self.stats.record_sent(lines);
+                self.stats.0.depth.fetch_add(1, Ordering::Relaxed);
                 true
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -334,6 +367,7 @@ impl<T: Send + 'static> BatchSender<T> {
         match self.tx.send(batch).await {
             Ok(()) => {
                 self.stats.record_sent(lines);
+                self.stats.0.depth.fetch_add(1, Ordering::Relaxed);
                 true
             }
             // The receiver dropped while we were parked. There is no consumer
@@ -345,17 +379,15 @@ impl<T: Send + 'static> BatchSender<T> {
 
     /// Live gauges plus counters, for a stats line alongside EPS.
     ///
-    /// Tokio exposes *remaining* capacity on the `Sender`, so depth is
-    /// derived as `max_capacity - capacity`. That is a snapshot read, not a
-    /// claim: a concurrent `send_batch` can move it between the two reads, so
-    /// treat the gauge as "at least this deep" rather than exact.
+    /// Reads the shared counters, so this is equivalent to calling
+    /// [`BatchSender::stats`]`::counters()` — both surfaces report the same
+    /// `depth` and `capacity`.
+    ///
+    /// `depth` is maintained explicitly by the send/receive pair rather than
+    /// sampled from the `Sender`, so a concurrent send can race the read. Treat
+    /// it as a gauge, not an exact count.
     pub fn snapshot(&self) -> ChannelStats {
-        let max = self.tx.max_capacity();
-        ChannelStats {
-            depth: max.saturating_sub(self.tx.capacity()),
-            capacity: max,
-            ..self.stats.counters()
-        }
+        self.stats.counters()
     }
 }
 
@@ -416,6 +448,9 @@ impl UdpSyslogListener {
         recv_stats: BatchChannelStats,
     ) -> anyhow::Result<()> {
         let (raw_tx, mut raw_rx) = mpsc::channel::<Vec<Bytes>>(RAW_BATCH_CHANNEL);
+        // Keep a handle so the receive-side depth gauge can be decremented as
+        // batches are drained below.
+        let recv_gauge = recv_stats.clone();
         let raw_sink = BatchSender::with_stats(raw_tx, self.config.batch_size, recv_stats);
 
         // Hold the receive task's handle rather than detaching it. If the
@@ -450,6 +485,10 @@ impl UdpSyslogListener {
                 }
             };
 
+            // This batch has left the receive channel, so drop it from the
+            // receive-side depth gauge.
+            recv_gauge.record_received(1);
+
             let mut parsed_batch = Vec::with_capacity(raw_batch.len());
             for raw_line in raw_batch {
                 // These bytes were validated as UTF-8 when the datagram was
@@ -462,6 +501,7 @@ impl UdpSyslogListener {
             if !sink.send_batch(parsed_batch) {
                 // Consumer vanished between the select and now. Same deadlock
                 // as the `closed()` arm: abort before awaiting.
+                sink.stats.record_received(1);
                 raw_task.abort();
                 break;
             }
@@ -1096,5 +1136,58 @@ mod tests {
             joined.is_ok(),
             "clean early exit should not report an error, got: {joined:?}"
         );
+    }
+
+    /// The pool's stats handle must expose live gauges, not zeros. This was a
+    /// review finding: `counters()` filled `depth`/`capacity` from
+    /// `ChannelStats::default()`, so a caller inspecting pool stats saw an
+    /// empty queue even when batches were queued.
+    #[tokio::test]
+    async fn test_stats_handle_reports_live_gauges() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let sink = BatchSender::new(tx, 2);
+        let handle = sink.stats();
+
+        let empty = handle.counters();
+        assert_eq!(empty.depth, 0, "nothing queued yet");
+        assert_eq!(
+            empty.capacity, 4,
+            "capacity must be recorded at construction"
+        );
+
+        sink.send_batch(vec![Bytes::from("a"), Bytes::from("b")]);
+        sink.send_batch(vec![Bytes::from("c")]);
+
+        let busy = handle.counters();
+        assert_eq!(busy.depth, 2, "gauge must reflect queued batches");
+        assert_eq!(busy.sent_batches, 2);
+        assert_eq!(
+            busy.capacity, 4,
+            "capacity survives alongside the live depth"
+        );
+
+        // Draining must walk the gauge back down, or it would drift upward
+        // forever and read as a permanently full queue.
+        handle.record_received(1);
+        assert_eq!(handle.counters().depth, 1);
+        handle.record_received(1);
+        assert_eq!(handle.counters().depth, 0);
+
+        // The real receiver still holds both batches — the gauge is a
+        // side-channel, not a change to the channel's own accounting.
+        assert_eq!(rx.recv().await.expect("first").len(), 2);
+        assert_eq!(rx.recv().await.expect("second").len(), 1);
+    }
+
+    /// `snapshot()` and `counters()` must not drift apart — they read the
+    /// same shared state, so a stats line built from either agrees.
+    #[tokio::test]
+    async fn test_snapshot_agrees_with_stats_handle() {
+        let (tx, _rx) = mpsc::channel(4);
+        let sink = BatchSender::new(tx, 2);
+        sink.send_batch(vec![Bytes::from("a")]);
+        sink.send_batch(vec![Bytes::from("b"), Bytes::from("c")]);
+
+        assert_eq!(sink.snapshot(), sink.stats().counters());
     }
 }
