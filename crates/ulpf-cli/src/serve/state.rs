@@ -346,19 +346,20 @@ impl AppState {
         let aggregates = match cached {
             Some(hit) => hit,
             None => {
+                // Both the Parquet walk and the ledger parse happen here, on
+                // the miss path only. Re-reading the ledger per recompute
+                // would repeat the unbounded cost this cache exists to remove.
                 let (breakdown, sampled) = self.read_dispositions();
                 let fresh = CorpusAggregates {
                     disposition_breakdown: breakdown,
                     disposition_sampled: sampled,
+                    ledger_totals: self.read_ledger_totals(),
                 };
                 self.corpus_cache.put(fingerprint, fresh.clone()).await;
                 fresh
             }
         };
-        // The ledger totals are cheap enough to re-read each recompute (the
-        // corpus cache above removed the expensive part, and a ledger parse is
-        // bounded by what a single run has anchored).
-        let (total_blocks, ledger_ingested) = self.read_ledger_totals();
+        let (total_blocks, ledger_ingested) = aggregates.ledger_totals;
         self.assemble_metrics(
             total_blocks,
             ledger_ingested,

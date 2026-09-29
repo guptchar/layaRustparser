@@ -83,10 +83,19 @@ pub fn fingerprint_ledger(path: &Path) -> LedgerFingerprint {
 }
 
 /// The expensive, block-set-dependent half of the metrics response.
+///
+/// The ledger totals live here too, not just the Parquet scan. The ledger is
+/// append-only and grows without bound, so re-parsing it per recompute would
+/// reintroduce exactly the cost this cache exists to remove — and it is the
+/// cost that gets worse over time, since a long-running deployment accumulates
+/// more ledger lines.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CorpusAggregates {
     pub disposition_breakdown: std::collections::HashMap<String, u64>,
     pub disposition_sampled: u64,
+    /// `(total_blocks, total_ingested)` as of the fingerprint these were
+    /// computed from.
+    pub ledger_totals: (u64, u64),
 }
 
 /// Cache of the last computed metrics response plus its derived aggregates.
@@ -345,6 +354,7 @@ mod tests {
         let aggregates = CorpusAggregates {
             disposition_breakdown: [("Allowed".to_string(), 10u64)].into_iter().collect(),
             disposition_sampled: 10,
+            ledger_totals: (2, 500),
         };
         cache.put(fp_a, aggregates.clone()).await;
 

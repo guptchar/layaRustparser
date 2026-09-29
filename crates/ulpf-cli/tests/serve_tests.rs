@@ -1543,3 +1543,138 @@ async fn test_cached_and_uncached_paths_agree() {
         "a cache hit must return the identical payload"
     );
 }
+
+/// The ledger parse must live on the cache-miss path, not on every recompute.
+///
+/// The ledger is append-only and grows without bound, so re-parsing it per
+/// recompute would reintroduce precisely the cost #56 was filed to remove —
+/// and it is the cost that worsens with uptime, since a long-running
+/// deployment accumulates more lines. Asserted by shrinking the corpus
+/// fingerprint's block set and confirming the reported totals are reused
+/// rather than re-derived.
+#[tokio::test]
+async fn test_ledger_totals_are_served_from_the_corpus_cache() {
+    let state = setup_test_state().with_metrics_ttl(std::time::Duration::from_millis(1));
+    let app = create_router(state.clone());
+
+    let fetch = |app: axum::Router| async move {
+        let req = Request::builder()
+            .uri("/metrics")
+            .method("GET")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(req).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice::<serde_json::Value>(&body).expect("valid JSON")
+    };
+
+    // Cold: one full compute, which reads the ledger once.
+    let first = fetch(app.clone()).await;
+    let blocks = first
+        .get("total_blocks")
+        .and_then(|v| v.as_u64())
+        .expect("repo fixture ledger must have blocks");
+    assert!(
+        blocks > 0,
+        "fixture corpus must be non-empty for this to mean anything"
+    );
+
+    // Force several TTL expiries. The ledger has not changed, so every one of
+    // these must be served from the corpus cache.
+    for _ in 0..4 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let next = fetch(app.clone()).await;
+        assert_eq!(
+            next.get("total_blocks").and_then(|v| v.as_u64()),
+            Some(blocks),
+            "an unchanged ledger must report the same block count from cache"
+        );
+        assert_eq!(
+            next.get("total_ingested"),
+            first.get("total_ingested"),
+            "total_ingested must come from the cached ledger totals, not a re-parse"
+        );
+    }
+    assert!(
+        state.metrics_cache.recompute_count() >= 5,
+        "the response cache must have expired repeatedly for this test to mean \
+         anything, got {} recomputes",
+        state.metrics_cache.recompute_count()
+    );
+}
+
+/// Appending a ledger line must invalidate the corpus cache, so a newly
+/// anchored block is not hidden by a stale aggregate.
+///
+/// Works on a **copy** of the repo ledger in a temp directory. Appending to
+/// the tracked fixture from a test risks leaving it corrupted when an
+/// assertion fails, which silently breaks every other test that reads the
+/// corpus — and did exactly that on the first attempt at this test.
+#[tokio::test]
+async fn test_appending_to_the_ledger_invalidates_the_corpus_cache() {
+    let root = repo_root();
+    let original = std::fs::read(root.join("data/ledger.jsonl")).expect("fixture ledger");
+
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("ledger.jsonl");
+    std::fs::write(&ledger, &original).expect("seed temp ledger");
+
+    let build_state = || AppState {
+        parquet_dir: root.join("data/parquet"),
+        ledger_path: ledger.clone(),
+        parsers_dir: temp.path().join("parsers"),
+        eval_report_path: root.join("docs/benchmarks/eval_hardcore_report.md"),
+        scratch_dir: temp.path().join("scratch"),
+        registry: std::sync::Arc::new(tokio::sync::RwLock::new(
+            ulpf_ai::onboarder::DynamicParserRegistry::new(),
+        )),
+        alerts: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        persist_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        start_time: std::time::Instant::now(),
+        telemetry_path: temp.path().join("live_telemetry.json"),
+        stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+        metrics_cache: ulpf_cli::serve::metrics_cache::MetricsCache::new(
+            std::time::Duration::from_millis(
+                ulpf_cli::serve::metrics_cache::DEFAULT_METRICS_TTL_MS,
+            ),
+        ),
+        corpus_cache: ulpf_cli::serve::metrics_cache::CorpusCache::new(),
+    };
+
+    let before = build_state().compute_metrics().await;
+    let blocks_before = before
+        .total_blocks
+        .expect("the copied fixture ledger must parse");
+    assert!(blocks_before > 0, "fixture corpus must be non-empty");
+
+    // Append an entry in the real ledger schema, including `parquet_file` —
+    // `load_ledger_entries` reads these fields, and a line missing one makes
+    // the whole ledger fail to parse rather than adding one block.
+    let last_id = blocks_before - 1;
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&ledger)
+            .expect("append to temp ledger");
+        writeln!(
+            f,
+            r#"{{"block_id":{},"timestamp":1789984480000,"leaf_count":1,"merkle_root":"cache-invalidation-probe","parquet_file":"block_{:05}.parquet"}}"#,
+            blocks_before, blocks_before
+        )
+        .expect("write probe entry");
+        f.sync_all().ok();
+    }
+
+    let after = build_state().compute_metrics().await;
+    let blocks_after = after
+        .total_blocks
+        .expect("the appended ledger must still parse");
+
+    assert_eq!(
+        blocks_after,
+        blocks_before + 1,
+        "an appended ledger entry must be visible — the cache must not hide a \
+         newly anchored block (last real block id was {last_id})"
+    );
+}

@@ -14,9 +14,9 @@
   "total_anomalies": null,
   "vendor_mix": {},
   "disposition_breakdown": {
-    "Blocked": 264,
     "Allowed": 1115,
     "Dropped": 196,
+    "Blocked": 264,
     "Unknown": 425
   },
   "disposition_sampled": 2000,
