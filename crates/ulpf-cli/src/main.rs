@@ -848,7 +848,11 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
     // measured property, not a live one: docs/INGEST_LIMITS.md.
     let queue_cap = args.queue_capacity;
 
-    tokio::spawn(async move {
+    // Keep the handle. The reporter is a detached loop that would otherwise
+    // keep running through shutdown and could publish a fresh `running: true`
+    // snapshot *after* the final stopped one, undoing it. Atomic replacement
+    // stops a torn read; it does not stop a later writer.
+    let reporter_handle = tokio::spawn(async move {
         let mut last_check = Instant::now();
         let mut last_count = 0u64;
 
@@ -1191,6 +1195,13 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
         .join()
         .expect("flush thread panicked during shutdown")
         .context("flush thread failed")?;
+
+    // Stop the reporter before writing the final snapshot. `abort` plus
+    // `await` matters twice over: it prevents a later `running: true` write
+    // from replacing the stopped one, and awaiting means any write already in
+    // flight has completed, so the final write cannot interleave with it.
+    reporter_handle.abort();
+    let _ = reporter_handle.await;
 
     // Publish a final snapshot marked as stopped. Without this, a clean exit
     // leaves the last sidecar saying `running: true`, and the serve plane
