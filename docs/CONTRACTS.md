@@ -32,6 +32,68 @@ Run from the repository root:
 
 ---
 
+## 2a. Release and Image Size Budget
+
+Two numbers that are easy to conflate and must never be quoted as one.
+
+### Release binary — measured, under target
+
+| Artifact | Bytes | Size |
+| :--- | --- | --- |
+| `ulpf` | 15,889,672 | **15.9 MB** (15.2 MiB) |
+| `ulpf-generator` | 1,210,664 | 1.2 MB (1.2 MiB) |
+
+Target is < 35 MB for the CLI. **Met.**
+
+Reproduce with the pinned toolchain and the release profile in `Cargo.toml`
+(`lto = "thin"`, `codegen-units = 1`, `strip = true`):
+
+```bash
+cargo build --release -p ulpf-cli
+stat -c%s target/release/ulpf
+```
+
+This figure was 22.8 MB before the release profile was tuned, and 18.6 MB
+before that. Always re-measure rather than quoting a remembered number.
+
+### Container image — not measured, over target
+
+**No image size is quoted, because none has been measured on this host** (the
+Docker daemon is unavailable in the authoring environment). The budget for the
+current `Dockerfile`:
+
+| Layer | Approx. |
+| :--- | --- |
+| `debian:bookworm-slim` base | ~74 MB |
+| `ulpf` | 15.9 MB |
+| `ulpf-generator` | 1.2 MB |
+| `ca-certificates` | ~0.4 MB |
+| `scripts/simulate_tamper.py` | < 0.1 MB |
+| **Total** | **~92 MB** |
+
+`python3` and `procps` have been removed and `docs/` is no longer copied, which
+saves roughly 20–25 MB. That is a real improvement and worth keeping on its own
+merits, but it does not change the verdict: **the base image alone is more
+than double the 35 MB target.**
+
+Reaching the target requires a different build pipeline, not a trim of this
+one:
+
+1. Fully static `x86_64-unknown-linux-musl` build of the CLI.
+2. `gcr.io/distroless/static` (or `scratch`) as the runtime base — about 2 MB.
+3. Drop `ulpf-generator` from the runtime image; ship it in a separate
+   load-generation image.
+
+That lands at roughly 18 MB. It is **not implemented and not verified**, so
+requirement k stays `partial` and no image size is published. Tracked in #45.
+
+`scripts/run_demo.sh` runs on the host, not inside the container: it shells out
+to `cargo build --release` and executes `target/release/ulpf`, neither of which
+exists in a runtime image. Removing `python3` from the image therefore does not
+affect the demo script, which uses the host's interpreter.
+
+---
+
 ## 3. Endpoints Specification
 
 ### 3.1 `GET /metrics` — Live Telemetry & Mix

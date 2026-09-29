@@ -6,7 +6,7 @@
 [![Schema](https://img.shields.io/badge/schema-OCSF%201.3-green.svg)](https://schema.ocsf.io/)
 [![Integrity](https://img.shields.io/badge/integrity-RFC%206962%20Merkle-purple.svg)](https://datatracker.ietf.org/doc/html/rfc6962)
 [![Air--Gap](https://img.shields.io/badge/deployment-100%25%20Air--Gapped-red.svg)](#air-gapped-deployment)
-[![Size](https://img.shields.io/badge/binary-22.8%20MB%20%3C%2035%20MB%20req-orange.svg)](#requirements-matrix)
+[![Size](https://img.shields.io/badge/binary-15.9%20MB%20%3C%2035%20MB%20req-green.svg)](#requirements-matrix)
 [![Repo](https://img.shields.io/badge/github-guptchar%2FlayaRustparser-blue.svg)](https://github.com/guptchar/layaRustparser)
 [![CI](https://github.com/guptchar/layaRustparser/actions/workflows/ci.yml/badge.svg)](https://github.com/guptchar/layaRustparser/actions/workflows/ci.yml)
 [![DeepWiki](https://img.shields.io/badge/docs-DeepWiki-blue.svg)](https://deepwiki.com/guptchar/layaRustparser)
@@ -29,7 +29,7 @@ New here? Ask questions about the codebase in plain English on our [DeepWiki](ht
 - **Action inviolability enforced on anchor tokens.** `ALLOW`/`PERMIT`/`ACCEPT` can never land in the same template cluster as `DENY`/`DROP`/`BLOCK`/`REJECT`; corpus-wide disposition purity is measured strictly in the [duel report](docs/benchmarks/eval_duel_report.md).
 - **Beats vanilla Drain 4–0.** The committed [duel](docs/benchmarks/eval_duel_report.md) runs both engines over probe, fuzzed, BGL and Thunderbird rounds; 3-tier wins grouping accuracy on **all four** (e.g. 98.41% vs 71.73% on fuzzed input).
 - **4,312× template compression.** 224,657 lines collapse to **32** Drain templates (baseline: 137,986) with template accuracy still at 100% — a ready-made feature table for any SIEM/ML system.
-- **Air-gapped for real.** Zero outbound calls, no telemetry, no model downloads. One static **22.8 MB** binary (requirement: < 35 MB), plus Docker.
+- **Air-gapped for real.** Zero outbound calls, no telemetry, no model downloads. One static **15.9 MB** binary (requirement: < 35 MB), plus Docker.
 
 Every accuracy number links to a timestamped report from `ulpf evaluate`, and every table regenerates with one command (see [Reproduce the proof](#reproduce-the-proof)).
 
@@ -96,6 +96,26 @@ python3 scripts/gen_adversarial.py --full 25000
 ./target/release/ulpf verify --file data/parquet/block_00000.parquet --ledger data/ledger.jsonl
 ```
 
+### Verifying the binary-size claim
+
+The **15.9 MB** figure quoted above is measured, not asserted. It was taken on
+2026-09-29 with the toolchain pinned in `rust-toolchain.toml` and the release
+profile in `Cargo.toml` (`lto = "thin"`, `codegen-units = 1`, `strip = true`):
+
+```bash
+cargo build --release -p ulpf-cli
+stat -c%s target/release/ulpf   # 15,889,672 bytes = 15.9 MB (15.2 MiB)
+```
+
+Re-run that before quoting the number. The size dropped from 22.8 MB when the
+release profile was tuned, which is exactly how the earlier 18.6 MB figure went
+stale — a published number with no command next to it rots silently.
+
+The **container image** is a separate number and is **not** measured. See the
+requirements matrix (row k) and [#45](https://github.com/guptchar/layaRustparser/issues/45)
+for why the current base image makes the < 35 MB target unreachable, and what
+would have to change.
+
 > `evaluate`/`benchmark` need **release** builds on an idle machine: accuracy rows are deterministic, timing rows swing with load — hence the report timestamps. Exit codes: **0 valid · 1 IO error · 2 tamper**; console transcript in [`docs/SCORECARDS.md`](docs/SCORECARDS.md#cryptographic-chain-of-custody).
 
 ## Testing & verification gate
@@ -125,7 +145,7 @@ cargo test --workspace --no-fail-fast
 | h | AI/ML-ready security and operational analytics | yes | **32 Drain templates from 224,657 lines (4,312× compression)** — pre-clustered feature IDs ([scorecards](docs/SCORECARDS.md)) |
 | i | Reduced parser development effort | yes | sample file → parser spec in **ms**, not days (quick start 7, [`docs/ONBOARDING_RUNBOOK.md`](docs/ONBOARDING_RUNBOOK.md)) |
 | j | Deployable in an air-gapped network | yes | single self-contained binaries, **zero** outbound calls anywhere in the runtime path |
-| k | Packaged in a container for platform independence (target < 35 MB) | partial | binary **≈ 22.8 MB on disk, inside the 35 MB target**; image itself still over target — slim-down is planned ([#45](https://github.com/guptchar/layaRustparser/issues/45)) |
+| k | Packaged in a container for platform independence (target < 35 MB) | partial | binary **15.9 MB measured**, inside the 35 MB target; **image size is not measured and is known to be over target** — the current `debian:bookworm-slim` base alone exceeds 35 MB before any of our code. Reaching the target needs a static musl build on `distroless/static`; see [#45](https://github.com/guptchar/layaRustparser/issues/45) for the size budget |
 
 Canonical verdicts with design, code, tests, and measured rows: [`docs/SRS.md`](docs/SRS.md). (The older tables in [`docs/archive/SIH_EVALUATION_DOSSIER.md`](docs/archive/SIH_EVALUATION_DOSSIER.md) §4 and [`docs/ARCHITECTURE_FINAL.md`](docs/ARCHITECTURE_FINAL.md) §4 are superseded/corrected to match it.)
 
@@ -220,7 +240,7 @@ Known gaps, each one measured:
 - **Full-scale p50 (6.15 µs) is over the 5.0 µs latency gate.** The gate is calibrated on the core corpus, where p50 is 3.84 µs and passes. At 224,657 lines the working set no longer stays cache-resident (still −94.2% vs baseline). The gate stays where it is; the gap is tracked in the roadmap.
 - **The 2026-09-25 full-scale 0.08× row (74,489 EPS) was a bad run, superseded 2026-09-28.** Re-running the identical 224,657-line dataset three times gave tiered 912,249 / 1,003,273 / 930,901 EPS (0.84 / 1.01 / 1.26×) — the old figure sits 12× below the lowest fresh run, and the 2026-09-24 session independently measured 1.05×. Likely cause: load-side collapse on the evaluator's tiered-throughput path, which funnels 16 threads through one shared `Arc<Mutex<DrainMiner>>` (production `ingest` gives each worker its own pipeline, so this ceiling is harness-specific). Details: [`FULL_DATASET_RESULTS.md`](FULL_DATASET_RESULTS.md) §2.
 - **Live-ingest socket ceiling ≈ 50k EPS loss-free** (4 MiB `SO_RCVBUF`; the kernel default sheds from ~30k) — measured per transport with loss accounting and a burst repro recipe in [`docs/INGEST_LIMITS.md`](docs/INGEST_LIMITS.md); the evaluator's in-process numbers are the engine's own capacity.
-- **Container image not yet < 35 MB** — binary requirement met (22.8 MB); distroless/musl slim-down is planned.
+- **Container image not yet < 35 MB** — the binary requirement is met and measured (15.9 MB). The image target is *not* met, and cannot be met with the current base: `debian:bookworm-slim` is roughly 74 MB on its own, so no amount of trimming our own layers brings the total under 35 MB. Getting there requires a fully static musl build on `distroless/static` and dropping the generator and fixture data from the runtime image — see [#45](https://github.com/guptchar/layaRustparser/issues/45). We have not measured an image size, so we are not quoting one.
 - One test is load-flaky by design (`test_classification_sub_microsecond_benchmark`, CI-skipped via `--skip`, not ignored) — documented in [`AGENTS.md`](AGENTS.md).
 
 ## Documentation map
