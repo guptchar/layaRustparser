@@ -76,7 +76,12 @@ impl LatencyWindow {
     }
 
     /// Snapshot the window into ascending order.
-    fn sorted(&self) -> Vec<f64> {
+    ///
+    /// Public so a reporter holding several workers' windows can merge their
+    /// samples. Each window is owned and written by exactly one worker, so the
+    /// lock here is uncontended in the steady state; only the once-per-second
+    /// aggregate takes it from a second thread.
+    pub fn sorted(&self) -> Vec<f64> {
         let ring = match self.samples.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -90,7 +95,18 @@ impl LatencyWindow {
     /// computing them against separately-sorted copies could otherwise pair a
     /// p50 from one window state with a p99 from another.
     pub fn percentiles(&self) -> (Option<f64>, Option<f64>, u64) {
-        let mut sorted = self.sorted();
+        percentiles_over(&self.sorted())
+    }
+}
+
+/// Percentiles over an arbitrary merged sample set.
+///
+/// Used both by a single window and by the reporter combining every worker's
+/// window, so a merged multi-worker figure and a single-worker figure are
+/// computed identically.
+pub fn percentiles_over(sorted: &[f64]) -> (Option<f64>, Option<f64>, u64) {
+    {
+        let mut sorted = sorted.to_vec();
         let n = sorted.len();
         if n == 0 {
             return (None, None, 0);
@@ -129,8 +145,6 @@ fn percentile_of(sorted: &[f64], q: f64) -> f64 {
 /// brief inconsistency of one line is preferable to taking a lock across the
 /// reporting path.
 pub struct TelemetryPublisher {
-    /// Fixed ring backing the latency percentiles.
-    pub latency: LatencyWindow,
     /// Line count for computing a rate between two reports.
     last_ingested: AtomicU64,
     /// Clock at the previous report, for the same purpose.
@@ -141,15 +155,22 @@ pub struct TelemetryPublisher {
     started: Instant,
 }
 
-impl TelemetryPublisher {
-    pub fn new(latency_capacity: usize) -> Self {
+impl Default for TelemetryPublisher {
+    fn default() -> Self {
         Self {
-            latency: LatencyWindow::new(latency_capacity),
             last_ingested: AtomicU64::new(0),
             last_report: std::sync::Mutex::new(Instant::now()),
             last_eps: AtomicU64::new(0),
             started: Instant::now(),
         }
+    }
+}
+
+impl TelemetryPublisher {
+    /// Build a publisher. Equivalent to [`TelemetryPublisher::default`];
+    /// kept as a named constructor because the call site reads better with it.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Milliseconds since this publisher was created — the monotonic clock
@@ -174,8 +195,9 @@ impl TelemetryPublisher {
         total_blocks: Option<u64>,
         total_anomalies: Option<u64>,
         vendor_counts: std::collections::BTreeMap<String, u64>,
+        latency: (Option<f64>, Option<f64>, u64),
     ) -> IngestSnapshot {
-        let (p50, p99, samples) = self.latency.percentiles();
+        let (p50, p99, samples) = latency;
         IngestSnapshot {
             monotonic_ms: self.monotonic_ms(),
             unix_ms: chrono::Utc::now().timestamp_millis(),
@@ -297,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_first_rate_observation_has_no_measurement() {
-        let p = TelemetryPublisher::new(8);
+        let p = TelemetryPublisher::new();
         assert_eq!(
             p.observe_ingested(100),
             None,
@@ -308,7 +330,7 @@ mod tests {
     /// A counter that goes backwards must not yield a negative rate.
     #[test]
     fn test_counter_reset_yields_zero_not_negative() {
-        let p = TelemetryPublisher::new(8);
+        let p = TelemetryPublisher::new();
         p.observe_ingested(1_000);
         std::thread::sleep(std::time::Duration::from_millis(5));
         let rate = p.observe_ingested(10).expect("second observation");
@@ -317,8 +339,9 @@ mod tests {
 
     #[test]
     fn test_snapshot_carries_measured_values_not_defaults() {
-        let p = TelemetryPublisher::new(16);
-        p.latency.record(4.0);
+        let p = TelemetryPublisher::new();
+        let window = LatencyWindow::new(16);
+        window.record(4.0);
         let snap = p.snapshot(
             Some(1234.0),
             Some((0.875, 800)),
@@ -330,6 +353,7 @@ mod tests {
             Some(1),
             Some(0),
             Default::default(),
+            window.percentiles(),
         );
         assert_eq!(snap.eps, Some(1234.0));
         assert_eq!(snap.latency_p50_micros, Some(4.0));
@@ -342,7 +366,7 @@ mod tests {
     /// Nothing measured must surface as null, never as a plausible constant.
     #[test]
     fn test_unmeasured_fields_are_null() {
-        let p = TelemetryPublisher::new(16);
+        let p = TelemetryPublisher::new();
         let snap = p.snapshot(
             None,
             None,
@@ -354,6 +378,7 @@ mod tests {
             None,
             None,
             Default::default(),
+            (None, None, 0),
         );
         assert_eq!(snap.eps, None);
         assert_eq!(snap.lru_hit_rate, None);

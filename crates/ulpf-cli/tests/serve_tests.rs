@@ -1179,3 +1179,124 @@ fn metrics_field(m: &ulpf_cli::serve::state::MetricsResponse, name: &str) -> Opt
         other => panic!("unhandled field {other}"),
     }
 }
+
+/// A measured zero is a real observation, not an absence. An ingest
+/// process that is running and has ingested nothing has measured
+/// `total_ingested: 0`; collapsing that to `null` would break the
+/// documented contract that `0` and `null` mean different things.
+#[tokio::test]
+async fn test_measured_zero_is_reported_as_zero_not_null() {
+    let temp_scratch = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+
+    let live_but_idle = ulpf_core::ingest::telemetry::IngestSnapshot {
+        monotonic_ms: 10_000,
+        unix_ms: chrono::Utc::now().timestamp_millis(),
+        // A real measurement of zero: running, but no traffic yet.
+        total_ingested: Some(0),
+        total_parsed: Some(0),
+        total_blocks: Some(0),
+        dropped_count: Some(0),
+        eps: Some(0.0),
+        running: true,
+        ..Default::default()
+    };
+    let sidecar = empty.path().join("live_telemetry.json");
+    ulpf_core::ingest::telemetry::write_snapshot(&sidecar, &live_but_idle).unwrap();
+
+    let state = AppState {
+        parquet_dir: empty.path().join("parquet"),
+        ledger_path: empty.path().join("ledger.jsonl"),
+        parsers_dir: empty.path().join("parsers"),
+        eval_report_path: empty.path().join("eval.json"),
+        scratch_dir: temp_scratch.path().to_path_buf(),
+        registry: std::sync::Arc::new(tokio::sync::RwLock::new(
+            ulpf_ai::onboarder::DynamicParserRegistry::new(),
+        )),
+        alerts: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        persist_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        start_time: std::time::Instant::now(),
+        telemetry_path: sidecar,
+        stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+    };
+
+    let metrics = state.compute_metrics();
+
+    assert_eq!(
+        metrics.total_ingested,
+        Some(0),
+        "a measured zero must be reported as 0, not collapsed to null"
+    );
+    assert_eq!(
+        metrics.eps,
+        Some(0.0),
+        "a measured zero rate must be reported as 0.0, not null"
+    );
+    assert_eq!(metrics.dropped_count, Some(0));
+}
+
+/// A snapshot whose writer stopped must not keep serving live gauges, and
+/// its reported age must be a real wall-clock distance rather than a
+/// sentinel like `u64::MAX`.
+#[tokio::test]
+async fn test_stopped_writer_clears_gauges_and_reports_real_age() {
+    let temp_scratch = tempfile::tempdir().unwrap();
+    let empty = tempfile::tempdir().unwrap();
+
+    let stopped = ulpf_core::ingest::telemetry::IngestSnapshot {
+        monotonic_ms: 5_000,
+        unix_ms: chrono::Utc::now().timestamp_millis() - 2_000,
+        eps: Some(7_777.0),
+        latency_p50_micros: Some(3.3),
+        queue_depth: Some(11),
+        dropped_count: Some(0),
+        total_ingested: Some(500),
+        // The writer says it is no longer running.
+        running: false,
+        ..Default::default()
+    };
+    let sidecar = empty.path().join("live_telemetry.json");
+    ulpf_core::ingest::telemetry::write_snapshot(&sidecar, &stopped).unwrap();
+
+    let state = AppState {
+        parquet_dir: empty.path().join("parquet"),
+        ledger_path: empty.path().join("ledger.jsonl"),
+        parsers_dir: empty.path().join("parsers"),
+        eval_report_path: empty.path().join("eval.json"),
+        scratch_dir: temp_scratch.path().to_path_buf(),
+        registry: std::sync::Arc::new(tokio::sync::RwLock::new(
+            ulpf_ai::onboarder::DynamicParserRegistry::new(),
+        )),
+        alerts: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        persist_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        start_time: std::time::Instant::now(),
+        telemetry_path: sidecar,
+        stale_after_ms: ulpf_core::ingest::telemetry::DEFAULT_STALE_AFTER_MS,
+    };
+
+    let metrics = state.compute_metrics();
+
+    assert_eq!(metrics.eps, None, "a stopped writer's EPS is not live");
+    assert_eq!(metrics.latency_p50_micros, None);
+    assert_eq!(metrics.queue_depth, None);
+    assert_eq!(
+        metrics.telemetry_state,
+        ulpf_cli::serve::state::TelemetryState::Stale
+    );
+    assert_eq!(metrics.status, "IDLE");
+
+    let age = metrics
+        .telemetry_age_ms
+        .expect("a stopped writer still has a real wall-clock age");
+    assert!(
+        age < u64::MAX / 2,
+        "age must be a real distance, not a sentinel (got {age})"
+    );
+    assert!(
+        (1_000..=60_000).contains(&age),
+        "age should reflect the 2s offset, got {age}ms"
+    );
+
+    // Cumulative facts survive: they are still true.
+    assert_eq!(metrics.total_ingested, Some(500));
+}

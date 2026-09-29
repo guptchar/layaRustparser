@@ -31,7 +31,7 @@ use ulpf_integrity::batcher::{BatchAccumulator, BatcherConfig, IncomingLog};
 use ulpf_integrity::storage::ParquetCompression;
 use ulpf_integrity::tamper::verify_block_with_ledger;
 
-use ulpf_cli::ingest_telemetry::TelemetryPublisher;
+use ulpf_cli::ingest_telemetry::{LatencyWindow, TelemetryPublisher};
 use ulpf_cli::{scorecard, serve};
 
 /// Upper bound on sample lines read by `ulpf onboard`.
@@ -766,13 +766,26 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
     // out-of-band serve plane, which cannot see inside the ingest task graph.
     // The sidecar sits beside the ledger so both planes derive the same path
     // from the same inputs without either knowing about the other.
-    let telemetry = Arc::new(TelemetryPublisher::new(LATENCY_WINDOW_SAMPLES));
+    let telemetry = Arc::new(TelemetryPublisher::new());
     let telemetry_path = ulpf_core::ingest::telemetry::default_snapshot_path(&args.ledger);
     // Per-vendor parsed counts, accumulated by the parse workers. A BTreeMap
     // behind a lock rather than a sharded atomic per vendor: one uncontended
     // lock per line is cheaper than the complexity, and this is the same
     // pattern the NewTemplate dedupe already uses on this path.
-    let vendor_counts: Arc<Mutex<BTreeMap<String, u64>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    // Per-worker telemetry state.
+    //
+    // These are deliberately NOT shared across workers. A single `Mutex`
+    // touched once per line would make every worker contend on the same cache
+    // line for every line, serializing exactly the workers that the
+    // per-worker `TieredPipeline` design exists to parallelize. Each worker
+    // therefore owns its own latency window and vendor map, and the reporter
+    // merges them once per reporting tick — off the hot path.
+    let worker_latency: Vec<Arc<LatencyWindow>> = (0..args.parse_workers)
+        .map(|_| Arc::new(LatencyWindow::new(LATENCY_WINDOW_SAMPLES)))
+        .collect();
+    let worker_vendors: Vec<Arc<Mutex<BTreeMap<String, u64>>>> = (0..args.parse_workers)
+        .map(|_| Arc::new(Mutex::new(BTreeMap::new())))
+        .collect();
     // Each parse worker owns its own `TieredPipeline`, so LRU statistics are
     // per-worker and have to be aggregated to describe the pipeline. Workers
     // publish into their own slot once per batch (not per line), and the
@@ -793,7 +806,8 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
     let worker_parsed_stats = worker_parsed.clone();
     let telemetry_stats = telemetry.clone();
     let telemetry_path_stats = telemetry_path.clone();
-    let vendor_counts_stats = vendor_counts.clone();
+    let worker_latency_stats = worker_latency.clone();
+    let worker_vendors_stats = worker_vendors.clone();
     let anomalies_stats = total_anomalies.clone();
     let worker_stats = worker_pipeline_stats.clone();
     // Static capacity gauges for the reporter: queue bound, kernel socket
@@ -843,10 +857,24 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
             // rather than trusting an old reading.
             let eps_now = telemetry_stats.observe_ingested(current);
             let lru_pair = aggregate_lru(&worker_stats);
-            let vendors = match vendor_counts_stats.lock() {
-                Ok(counts) => counts.clone(),
-                Err(poisoned) => poisoned.into_inner().clone(),
-            };
+            // Merge per-worker vendor maps and latency windows. This runs
+            // once per reporting tick, never per line, so the per-worker locks
+            // it touches are held for microseconds by a single thread.
+            let mut vendors: BTreeMap<String, u64> = BTreeMap::new();
+            for map in worker_vendors_stats.iter() {
+                let counts = match map.lock() {
+                    Ok(counts) => counts,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                for (vendor, n) in counts.iter() {
+                    *vendors.entry(vendor.clone()).or_insert(0) += *n;
+                }
+            }
+            let mut samples: Vec<f64> = Vec::new();
+            for window in worker_latency_stats.iter() {
+                samples.extend_from_slice(&window.sorted());
+            }
+            let latency = ulpf_cli::ingest_telemetry::percentiles_over(&samples);
             let snapshot = telemetry_stats.snapshot(
                 eps_now,
                 lru_pair,
@@ -858,6 +886,7 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
                 Some(blocks), // already cloned as `total_blocks_stats`
                 Some(anomalies_stats.load(Ordering::Relaxed)),
                 vendors,
+                latency,
             );
             if let Err(e) =
                 ulpf_core::ingest::telemetry::write_snapshot(&telemetry_path_stats, &snapshot)
@@ -970,8 +999,8 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
         let shutdown_w = parse_shutdown.clone();
         let my_parsed_w = my_parsed.clone();
         let emitted_w = emitted_templates.clone();
-        let telemetry_w = telemetry.clone();
-        let vendor_counts_w = vendor_counts.clone();
+        let vendor_counts_w = worker_vendors[worker_id].clone();
+        let latency_w = worker_latency[worker_id].clone();
         let worker_stats_w = worker_pipeline_stats.clone();
         worker_handles.push(
             std::thread::Builder::new()
@@ -1009,14 +1038,14 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
                             // and one mutex-guarded f64 store per line.
                             let parse_started = Instant::now();
                             let (event, anomaly) = pipeline.process_live(raw_str);
-                            telemetry_w
-                                .latency
-                                .record(parse_started.elapsed().as_secs_f64() * 1_000_000.0);
+                            latency_w.record(parse_started.elapsed().as_secs_f64() * 1_000_000.0);
                             parsed_w.fetch_add(1, Ordering::Relaxed);
                             my_parsed_w.fetch_add(1, Ordering::Relaxed);
-                            // Per-vendor counts for the live vendor mix. A
-                            // poisoned lock degrades to skipping the count
-                            // rather than dropping the event.
+                            // Per-vendor counts for the live vendor mix.
+                            // This worker's own map: uncontended, because no
+                            // other worker ever touches it. A poisoned lock
+                            // degrades to skipping the count rather than
+                            // dropping the event.
                             if let Ok(mut counts) = vendor_counts_w.lock() {
                                 *counts
                                     .entry(event.metadata.product.vendor_name.clone())

@@ -292,12 +292,18 @@ impl AppState {
         let (telemetry_state, telemetry_age_ms, gauge) = match &live {
             None => (TelemetryState::Absent, None, IngestSnapshot::default()),
             Some(snap) => {
-                // `running: false` means the writer exited cleanly. The
-                // monotonic clock is the ingest process's own, so age is only
-                // meaningful while that process is alive to compare against;
-                // a stopped writer is reported stale regardless of the number.
+                // `running: false` means the writer exited cleanly. Its live
+                // gauges describe a pipeline that no longer exists, so they
+                // are cleared here for the same reason the stale path clears
+                // them. The age is still reported — it is a real wall-clock
+                // distance, and a reader may want to know how long ago the
+                // writer stopped. Reporting `u64::MAX` instead would be a
+                // number that means nothing.
                 if !snap.running {
-                    (TelemetryState::Stale, Some(u64::MAX), snap.clone())
+                    let age = self
+                        .wall_clock_age_ms(snap.unix_ms)
+                        .map(|a| a.max(0) as u64);
+                    (TelemetryState::Stale, age, snap.without_live_gauges())
                 } else {
                     // Age is computed against wall-clock proximity because the
                     // two processes do not share a monotonic epoch. Comparing
@@ -334,12 +340,16 @@ impl AppState {
             .map(|(k, v)| (k.clone(), *v))
             .collect();
 
-        // Prefer the live counter; fall back to the ledger's leaf total so the
-        // field is never invented but is still meaningful when ingest is idle.
-        let total_ingested = gauge
-            .total_ingested
-            .or(Some(ledger_ingested))
-            .filter(|v| *v > 0);
+        // Prefer the live counter. The `> 0` filter applies ONLY to the ledger
+        // fallback, never to the live measurement: a snapshot reporting
+        // `total_ingested: 0` is a real observation of a running pipeline that
+        // has ingested nothing yet, and collapsing it to `null` would break
+        // the documented contract that `0` and `null` mean different things.
+        let total_ingested = match gauge.total_ingested {
+            Some(measured) => Some(measured),
+            None if ledger_ingested > 0 => Some(ledger_ingested),
+            None => None,
+        };
         // Same rule for block count: the ledger is the durable authority and
         // outlives the ingest process, so it wins whenever it has entries. A
         // cleared (stale) snapshot retains these cumulative fields, so the
