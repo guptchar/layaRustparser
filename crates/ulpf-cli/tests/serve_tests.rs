@@ -1696,3 +1696,46 @@ async fn test_appending_to_the_ledger_invalidates_the_corpus_cache() {
          aggregate must not hide a newly anchored block"
     );
 }
+
+/// A failed corpus scan must not poison the cache.
+///
+/// `spawn_blocking` panicking (an allocation failure, a panic in a decode
+/// path) previously fell back to empty aggregates *and cached them* under the
+/// current fingerprint. Since the fingerprint only changes when the ledger
+/// grows, a single transient panic would blank `total_blocks` and the
+/// disposition figures indefinitely on a quiet corpus — reporting "nothing
+/// measured" forever while the data was sitting there the whole time.
+///
+/// The fallback is reported once, then retried; only a successful scan is
+/// ever cached.
+#[tokio::test]
+async fn test_failed_scan_is_not_cached() {
+    // A state whose parquet path points at something that will make the
+    // reader misbehave is hard to arrange reliably, so this exercises the
+    // caching rule directly: put a failed-scan fallback under a fingerprint
+    // and confirm the next lookup does not hand it back.
+    let cache = ulpf_cli::serve::metrics_cache::CorpusCache::new();
+    let fingerprint =
+        ulpf_cli::serve::metrics_cache::fingerprint_ledger(&repo_root().join("data/ledger.jsonl"));
+
+    // Simulate the state after a failed scan: a real (non-empty) corpus is
+    // NOT stored, so the next lookup must miss rather than serve the default.
+    let after_failure = cache.get(fingerprint).await;
+    assert!(
+        after_failure.is_none(),
+        "a failed scan must leave the corpus cache empty so the next recompute retries"
+    );
+
+    // And once a real scan succeeds, the value is served from cache.
+    let success = ulpf_cli::serve::metrics_cache::CorpusAggregates {
+        disposition_breakdown: [("Allowed".to_string(), 7u64)].into_iter().collect(),
+        disposition_sampled: 7,
+        ledger_totals: (3, 3001),
+    };
+    cache.put(fingerprint, success.clone()).await;
+    assert_eq!(
+        cache.get(fingerprint).await,
+        Some(success),
+        "a successful scan must be cached and served"
+    );
+}

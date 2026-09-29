@@ -367,7 +367,13 @@ impl AppState {
             Some(hit) => hit,
             None => {
                 let scan = self.clone();
-                let fresh = tokio::task::spawn_blocking(move || {
+                // Only a *successful* scan is cached. Caching the failure
+                // fallback would pin empty aggregates under the current
+                // fingerprint until the ledger next changes, so a transient
+                // panic would blank `total_blocks` and dispositions
+                // indefinitely on a quiet corpus. A failed scan is reported
+                // once and then retried on the next recompute.
+                let computed = tokio::task::spawn_blocking(move || {
                     let (breakdown, sampled) = scan.read_dispositions();
                     CorpusAggregates {
                         disposition_breakdown: breakdown,
@@ -375,17 +381,20 @@ impl AppState {
                         ledger_totals: scan.read_ledger_totals(),
                     }
                 })
-                .await
-                .unwrap_or_else(|e| {
-                    // A panicking scan must not take down the endpoint. Fall
-                    // back to empty aggregates, which the response already
-                    // presents as "nothing measured" rather than as a
-                    // fabricated zero.
-                    tracing::error!("corpus scan task failed: {e}");
-                    CorpusAggregates::default()
-                });
-                self.corpus_cache.put(fingerprint, fresh.clone()).await;
-                fresh
+                .await;
+                match computed {
+                    Ok(fresh) => {
+                        self.corpus_cache.put(fingerprint, fresh.clone()).await;
+                        fresh
+                    }
+                    Err(e) => {
+                        // Do not cache this. Empty aggregates are reported as
+                        // "nothing measured" rather than as a fabricated
+                        // zero, and the next recompute tries again.
+                        tracing::error!("corpus scan task failed: {e}");
+                        CorpusAggregates::default()
+                    }
+                }
             }
         };
         let (total_blocks, ledger_ingested) = aggregates.ledger_totals;
