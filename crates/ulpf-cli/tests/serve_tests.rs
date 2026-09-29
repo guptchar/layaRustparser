@@ -1606,10 +1606,16 @@ async fn test_ledger_totals_are_served_from_the_corpus_cache() {
 /// Appending a ledger line must invalidate the corpus cache, so a newly
 /// anchored block is not hidden by a stale aggregate.
 ///
+/// Exercises the *cached* path deliberately. An earlier version of this test
+/// built a fresh `AppState` per call and called `compute_metrics`, which
+/// bypasses `corpus_cache` entirely — it would have passed even if
+/// `CorpusCache::get` ignored the fingerprint completely, so it proved only
+/// that the ledger parses.
+///
 /// Works on a **copy** of the repo ledger in a temp directory. Appending to
-/// the tracked fixture from a test risks leaving it corrupted when an
-/// assertion fails, which silently breaks every other test that reads the
-/// corpus — and did exactly that on the first attempt at this test.
+/// the tracked fixture from a test risks leaving it corrupted when an assertion
+/// fails, which silently breaks every other test that reads the corpus — and
+/// did exactly that on the first attempt.
 #[tokio::test]
 async fn test_appending_to_the_ledger_invalidates_the_corpus_cache() {
     let root = repo_root();
@@ -1619,7 +1625,9 @@ async fn test_appending_to_the_ledger_invalidates_the_corpus_cache() {
     let ledger = temp.path().join("ledger.jsonl");
     std::fs::write(&ledger, &original).expect("seed temp ledger");
 
-    let build_state = || AppState {
+    // ONE state, so the corpus cache survives across the append and the
+    // invalidation is what makes the new block appear.
+    let state = AppState {
         parquet_dir: root.join("data/parquet"),
         ledger_path: ledger.clone(),
         parsers_dir: temp.path().join("parsers"),
@@ -1639,18 +1647,25 @@ async fn test_appending_to_the_ledger_invalidates_the_corpus_cache() {
             ),
         ),
         corpus_cache: ulpf_cli::serve::metrics_cache::CorpusCache::new(),
-    };
+    }
+    .with_metrics_ttl(std::time::Duration::from_millis(30));
 
-    let before = build_state().compute_metrics().await;
+    // First compute populates the corpus cache.
+    let before = state.metrics_cached().await;
     let blocks_before = before
         .total_blocks
         .expect("the copied fixture ledger must parse");
     assert!(blocks_before > 0, "fixture corpus must be non-empty");
 
+    // A second compute with an unchanged ledger must be served from the
+    // corpus cache. This is the precondition that makes the rest meaningful:
+    // if the cache were not holding, the test could not distinguish
+    // "invalidated correctly" from "recomputed anyway".
+    let _ = state.metrics_cached().await;
+
     // Append an entry in the real ledger schema, including `parquet_file` —
     // `load_ledger_entries` reads these fields, and a line missing one makes
     // the whole ledger fail to parse rather than adding one block.
-    let last_id = blocks_before - 1;
     {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -1666,7 +1681,10 @@ async fn test_appending_to_the_ledger_invalidates_the_corpus_cache() {
         f.sync_all().ok();
     }
 
-    let after = build_state().compute_metrics().await;
+    // Past the TTL, the response cache expires and the recompute consults the
+    // corpus cache — which must now miss, because the ledger changed.
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let after = state.metrics_cached().await;
     let blocks_after = after
         .total_blocks
         .expect("the appended ledger must still parse");
@@ -1674,7 +1692,7 @@ async fn test_appending_to_the_ledger_invalidates_the_corpus_cache() {
     assert_eq!(
         blocks_after,
         blocks_before + 1,
-        "an appended ledger entry must be visible — the cache must not hide a \
-         newly anchored block (last real block id was {last_id})"
+        "an appended ledger entry must invalidate the corpus cache — a stale \
+         aggregate must not hide a newly anchored block"
     );
 }
