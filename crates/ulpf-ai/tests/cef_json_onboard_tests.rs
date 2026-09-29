@@ -95,8 +95,13 @@ fn train_json() -> ParserDefinition {
 }
 
 /// CEF recall on ALL CEF lines of fortigate.log (trained on the first 25):
-/// ≥95% parse with endpoints + ports + action, and act=deny/accept lines
-/// never report UNKNOWN.
+/// ≥95% parse with endpoints + ports + action, and every successfully-parsed
+/// act=deny/accept line carries a non-UNKNOWN disposition.
+///
+/// The ≥95% threshold is the real gate and it is NOT dead: a line that fails
+/// to parse is counted and named, not panicked on. An earlier version of this
+/// test panicked in the `Err` arm, which meant the threshold could never be
+/// reached — the test enforced 100% while its doc comment claimed 95%.
 #[test]
 fn test_cef_recall_on_fortigate_cef_lines() {
     let def = train_cef();
@@ -108,74 +113,98 @@ fn test_cef_recall_on_fortigate_cef_lines() {
         .collect();
 
     let mut matched = 0;
+    let mut failures: Vec<String> = Vec::new();
     let mut verdict_lines = 0;
     let mut verdict_known = 0;
+    let mut unknown_verdicts: Vec<String> = Vec::new();
     for line in &cef {
         match def.parse(line) {
             Ok(ev) => {
                 assert!(
                     ev.src_endpoint.ip.is_some() && ev.dst_endpoint.ip.is_some(),
-                    "endpoints captured: {line}"
+                    "a MATCHED line must carry both endpoints: {line}"
                 );
                 assert!(
                     ev.src_endpoint.port.is_some() && ev.dst_endpoint.port.is_some(),
-                    "spt/dpt captured: {line}"
+                    "a MATCHED line must carry spt/dpt: {line}"
                 );
                 matched += 1;
                 if line.contains("act=deny") || line.contains("act=accept") {
                     verdict_lines += 1;
                     if ev.disposition != "Unknown" {
                         verdict_known += 1;
+                    } else {
+                        unknown_verdicts.push((*line).to_string());
                     }
                 }
             }
-            Err(e) => panic!("CEF line must parse: {line}\n  error: {e}"),
+            Err(e) => failures.push(format!("{}: {e}", &line[..line.len().min(160)])),
         }
     }
     let pct = matched as f64 / cef.len() as f64 * 100.0;
     assert!(
         pct >= 95.0,
-        "CEF recall {matched}/{} = {pct:.1}% (need ≥95%)",
-        cef.len()
+        "CEF recall {matched}/{} = {pct:.1}% (need ≥95%)\n  first failures:\n    {}",
+        cef.len(),
+        failures
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n    ")
     );
     assert!(
         verdict_lines > 0,
         "corpus must contain act=deny/accept lines"
     );
     assert_eq!(
-        verdict_known, verdict_lines,
-        "every act=deny/accept line must have a known disposition"
+        verdict_known,
+        verdict_lines,
+        "every MATCHED act=deny/accept line must have a known disposition\n  offenders:\n    {}",
+        unknown_verdicts
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n    ")
     );
 }
 
 /// JSON onboarding over the full suricata.json (mixed alert/flow/dns):
-/// ≥95% of all 260 records parse with endpoints + ports.
+/// ≥95% of all records parse with endpoints + ports.
+///
+/// As in the CEF test, unparsed lines are counted and named rather than
+/// panicked on, so the ≥95% threshold is the gate that actually runs.
 #[test]
 fn test_json_onboard_suricata_eve() {
     let def = train_json();
     let lines = read_lines(&raw_dir().join("suricata.json"));
 
     let mut matched = 0;
+    let mut failures: Vec<String> = Vec::new();
     for line in &lines {
         match def.parse(line) {
             Ok(ev) => {
                 assert!(
                     ev.src_endpoint.ip.is_some() && ev.dst_endpoint.ip.is_some(),
-                    "endpoints captured: {line}"
+                    "a MATCHED record must carry both endpoints: {line}"
                 );
                 matched += 1;
             }
-            Err(e) => panic!(
-                "EVE line must parse: {}\n  error: {e}",
-                &line[..line.len().min(200)]
-            ),
+            Err(e) => failures.push(format!("{}: {e}", &line[..line.len().min(160)])),
         }
     }
     let pct = matched as f64 / lines.len() as f64 * 100.0;
     assert!(
         pct >= 95.0,
-        "EVE recall {matched}/{} = {pct:.1}% (need ≥95%)",
-        lines.len()
+        "EVE recall {matched}/{} = {pct:.1}% (need ≥95%)\n  first failures:\n    {}",
+        lines.len(),
+        failures
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n    ")
     );
 }
 
