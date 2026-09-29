@@ -337,17 +337,27 @@ impl<T: Send + 'static> BatchSender<T> {
     /// not a shutdown: the batch is shed, counted, and `true` is returned.
     pub fn send_batch(&self, batch: Vec<T>) -> bool {
         let lines = batch.len();
+        // Publish the depth *before* the send, not after. A consumer can wake
+        // and drain the instant `try_send` succeeds, so incrementing afterwards
+        // leaves a window where a consumer already decremented a depth this
+        // counter has not raised — the gauge would read one too low, and the
+        // subsequent `record_received` could underflow the unsigned counter.
+        // Rolling back on failure keeps the two paths balanced.
+        self.stats.0.depth.fetch_add(1, Ordering::Relaxed);
         match self.tx.try_send(batch) {
             Ok(()) => {
                 self.stats.record_sent(lines);
-                self.stats.0.depth.fetch_add(1, Ordering::Relaxed);
                 true
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.stats.record_dropped(lines);
+                self.stats.0.depth.fetch_sub(1, Ordering::Relaxed);
                 true
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.stats.0.depth.fetch_sub(1, Ordering::Relaxed);
+                false
+            }
         }
     }
 
@@ -364,16 +374,21 @@ impl<T: Send + 'static> BatchSender<T> {
     /// batch counts as sent, and `false` means the consumer is gone.
     pub async fn send_batch_async(&self, batch: Vec<T>) -> bool {
         let lines = batch.len();
+        // Same ordering rule as `send_batch`: raise depth before the batch can
+        // become visible, roll back if it never lands.
+        self.stats.0.depth.fetch_add(1, Ordering::Relaxed);
         match self.tx.send(batch).await {
             Ok(()) => {
                 self.stats.record_sent(lines);
-                self.stats.0.depth.fetch_add(1, Ordering::Relaxed);
                 true
             }
-            // The receiver dropped while we were parked. There is no consumer
-            // left to shed the batch to, so this is a shutdown, not a loss to
-            // count.
-            Err(_) => false,
+            // The receiver dropped while we were parked, so the batch was
+            // never enqueued. There is no consumer left to shed it to — this
+            // is a shutdown, not a loss to count.
+            Err(_) => {
+                self.stats.0.depth.fetch_sub(1, Ordering::Relaxed);
+                false
+            }
         }
     }
 
@@ -500,8 +515,9 @@ impl UdpSyslogListener {
             }
             if !sink.send_batch(parsed_batch) {
                 // Consumer vanished between the select and now. Same deadlock
-                // as the `closed()` arm: abort before awaiting.
-                sink.stats.record_received(1);
+                // as the `closed()` arm: abort before awaiting. The send never
+                // enqueued, so there is nothing to subtract from the output
+                // depth gauge.
                 raw_task.abort();
                 break;
             }
@@ -1189,5 +1205,125 @@ mod tests {
         sink.send_batch(vec![Bytes::from("b"), Bytes::from("c")]);
 
         assert_eq!(sink.snapshot(), sink.stats().counters());
+    }
+
+    /// The depth gauge must not drift when a send does not land.
+    ///
+    /// A shed (`Full`) or a closed consumer (`Closed`) never enqueues a batch,
+    /// so the pre-send increment has to be rolled back. If it were not, the
+    /// gauge would ratchet upward and report a permanently full queue. The
+    /// shutdown path matters most: `run_parsed` also skips `record_received`
+    /// on a failed send, so a leaked increment there has nothing to cancel it.
+    #[tokio::test]
+    async fn test_depth_gauge_rolls_back_on_failed_send() {
+        // Full-channel path: shed batches must not accumulate depth.
+        let (tx, _rx) = mpsc::channel(1);
+        let sink = BatchSender::new(tx, 2);
+        let stats = sink.stats();
+
+        assert!(sink.send_batch(vec![Bytes::from("a")]));
+        assert_eq!(stats.counters().depth, 1);
+
+        for _ in 0..5 {
+            assert!(sink.send_batch(vec![Bytes::from("shed")]));
+        }
+        assert_eq!(
+            stats.counters().depth,
+            1,
+            "shed batches must not inflate the depth gauge"
+        );
+
+        // Closed-consumer path: a failed send is not a delivery and not depth.
+        let (tx2, rx2) = mpsc::channel(4);
+        let sink2 = BatchSender::new(tx2, 2);
+        let stats2 = sink2.stats();
+        assert!(sink2.send_batch(vec![Bytes::from("first")]));
+        assert_eq!(stats2.counters().depth, 1);
+        drop(rx2);
+        assert!(!sink2.send_batch(vec![Bytes::from("never lands")]));
+        assert_eq!(
+            stats2.counters().depth,
+            1,
+            "a closed-consumer send must not leave depth behind"
+        );
+
+        // Same for the awaited path.
+        let (tx3, rx3) = mpsc::channel(4);
+        let sink3 = BatchSender::new(tx3, 2);
+        let stats3 = sink3.stats();
+        assert!(sink3.send_batch_async(vec![Bytes::from("first")]).await);
+        assert_eq!(stats3.counters().depth, 1);
+        drop(rx3);
+        assert!(
+            !sink3
+                .send_batch_async(vec![Bytes::from("never lands")])
+                .await
+        );
+        assert_eq!(
+            stats3.counters().depth,
+            1,
+            "a closed-consumer async send must not leave depth behind"
+        );
+    }
+
+    /// Depth must be raised before the batch is visible, so a consumer that
+    /// wakes immediately cannot decrement a counter that has not been
+    /// incremented yet (which would underflow and wrap to a huge number).
+    ///
+    /// Drives a producer and a consumer against the same channel with no
+    /// ordering between them, then asserts the gauge neither underflows during
+    /// the race nor drifts afterwards.
+    #[tokio::test]
+    async fn test_depth_never_underflows_under_concurrent_drain() {
+        let (tx, mut rx) = mpsc::channel(64);
+        let sink = BatchSender::new(tx, 2);
+        let stats = sink.stats();
+
+        const BATCHES: usize = 200;
+
+        let consumer_stats = stats.clone();
+        let consumer = tokio::spawn(async move {
+            let mut seen = 0usize;
+            // Loop until the channel closes rather than a fixed count: shed
+            // batches mean fewer than BATCHES ever arrive, and a fixed-count
+            // loop would block forever waiting for one that was dropped.
+            while rx.recv().await.is_some() {
+                // Mirror the real consumer: decrement as each batch is taken.
+                consumer_stats.record_received(1);
+                let depth = consumer_stats.counters().depth;
+                assert!(
+                    depth < 1_000_000,
+                    "depth underflowed: unsigned wraparound produced {depth}"
+                );
+                seen += 1;
+            }
+            seen
+        });
+
+        // Producer runs on the same runtime, releasing the final sender when
+        // it finishes so the consumer's `recv` observes the close.
+        for i in 0..BATCHES {
+            sink.send_batch(vec![Bytes::from(format!("line-{i}"))]);
+        }
+        drop(sink);
+
+        let seen = tokio::time::timeout(Duration::from_secs(5), consumer)
+            .await
+            .expect("consumer must drain and observe the close")
+            .expect("consumer task must not panic");
+
+        let counters = stats.counters();
+        // Shed is expected under this race and is fine — what matters is that
+        // exactly the delivered batches are reflected in the gauge.
+        assert_eq!(counters.sent_batches, seen as u64);
+        assert_eq!(
+            counters.sent_batches + counters.dropped_batches,
+            BATCHES as u64,
+            "every produced batch is either sent or shed, never both"
+        );
+        assert_eq!(
+            counters.depth, 0,
+            "gauge must return to zero once every delivered batch is consumed"
+        );
     }
 }
