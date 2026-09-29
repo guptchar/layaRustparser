@@ -492,6 +492,38 @@ fn resolve_pop_chunk(args: &IngestArgs) -> usize {
     }
 }
 
+/// Merge every parse worker's vendor map into one cumulative view.
+///
+/// Workers own their maps exclusively, so each lock is uncontended while the
+/// worker writes and is taken only here, once per reporting tick.
+fn merge_vendor_counts(maps: &[Arc<Mutex<BTreeMap<String, u64>>>]) -> BTreeMap<String, u64> {
+    let mut merged: BTreeMap<String, u64> = BTreeMap::new();
+    for map in maps {
+        let counts = match map.lock() {
+            Ok(counts) => counts,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for (vendor, n) in counts.iter() {
+            *merged.entry(vendor.clone()).or_insert(0) += *n;
+        }
+    }
+    merged
+}
+
+/// Merge every parse worker's latency window into one percentile figure.
+///
+/// Each worker times its own lines, so the pipeline-wide latency distribution
+/// is the union of the per-worker windows. Merging samples (rather than
+/// averaging per-worker percentiles) is what keeps a worker that parsed two
+/// lines from counting as heavily as one that parsed a million.
+fn merge_latency(windows: &[Arc<LatencyWindow>]) -> (Option<f64>, Option<f64>, u64) {
+    let mut samples: Vec<f64> = Vec::new();
+    for window in windows {
+        samples.extend_from_slice(&window.sorted());
+    }
+    ulpf_cli::ingest_telemetry::percentiles_over(&samples)
+}
+
 /// Aggregate per-worker LRU cache statistics into one pipeline-wide ratio.
 ///
 /// Each parse worker owns its own `TieredPipeline` and therefore its own
@@ -860,21 +892,8 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
             // Merge per-worker vendor maps and latency windows. This runs
             // once per reporting tick, never per line, so the per-worker locks
             // it touches are held for microseconds by a single thread.
-            let mut vendors: BTreeMap<String, u64> = BTreeMap::new();
-            for map in worker_vendors_stats.iter() {
-                let counts = match map.lock() {
-                    Ok(counts) => counts,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                for (vendor, n) in counts.iter() {
-                    *vendors.entry(vendor.clone()).or_insert(0) += *n;
-                }
-            }
-            let mut samples: Vec<f64> = Vec::new();
-            for window in worker_latency_stats.iter() {
-                samples.extend_from_slice(&window.sorted());
-            }
-            let latency = ulpf_cli::ingest_telemetry::percentiles_over(&samples);
+            let vendors = merge_vendor_counts(&worker_vendors_stats);
+            let latency = merge_latency(&worker_latency_stats);
             let snapshot = telemetry_stats.snapshot(
                 eps_now,
                 lru_pair,
@@ -1172,6 +1191,41 @@ async fn run_ingest(args: IngestArgs) -> Result<()> {
         .join()
         .expect("flush thread panicked during shutdown")
         .context("flush thread failed")?;
+
+    // Publish a final snapshot marked as stopped. Without this, a clean exit
+    // leaves the last sidecar saying `running: true`, and the serve plane
+    // would keep reporting those gauges as LIVE until the staleness bound
+    // expired — up to 5 seconds of a stopped pipeline looking healthy.
+    //
+    // Built from the same cumulative counters and the merged vendor map, then
+    // stripped of its live gauges: the totals are still true, the gauges are
+    // not, because the process that produced them has exited. A failure here
+    // is logged and swallowed — it must not turn a successful shutdown into
+    // a failed one, and the staleness bound already covers a missed write.
+    {
+        let vendors = merge_vendor_counts(&worker_vendors);
+        let latency = merge_latency(&worker_latency);
+        let final_snapshot = telemetry
+            .snapshot(
+                None,
+                aggregate_lru(&worker_pipeline_stats),
+                None,
+                Some(queue_cap),
+                Some(queue.stats().dropped + flush_dropped.load(Ordering::Relaxed)),
+                Some(total_ingested.load(Ordering::Relaxed)),
+                Some(total_parsed.load(Ordering::Relaxed)),
+                Some(total_blocks.load(Ordering::Relaxed)),
+                Some(total_anomalies.load(Ordering::Relaxed)),
+                vendors,
+                latency,
+            )
+            .without_live_gauges();
+        if let Err(e) =
+            ulpf_core::ingest::telemetry::write_snapshot(&telemetry_path, &final_snapshot)
+        {
+            tracing::warn!("final live telemetry snapshot not written: {e}");
+        }
+    }
     // One snapshot for the whole summary line: re-reading the counters per
     // field could mix a pre-drain length with post-drain byte counts under
     // in-flight pushes. The lossless claim only holds when nothing was
