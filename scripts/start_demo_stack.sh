@@ -14,6 +14,7 @@ echo "=========================================================="
 
 # Clean up previous instances with strict pattern matching
 echo "==> [1/4] Stopping existing processes..."
+pkill -9 -f "run_demo_loop.sh" 2>/dev/null || true
 pkill -9 -f "ulpf serve" 2>/dev/null || true
 pkill -9 -f "ulpf ingest" 2>/dev/null || true
 pkill -9 -f "ulpf-generator" 2>/dev/null || true

@@ -86,7 +86,7 @@ fi
 
 # 5. Health Check Audit
 echo "==> [5/5] Performing loopback health checks..."
-MAX_ATTEMPTS=15
+MAX_ATTEMPTS=20
 SUCCESS=0
 
 for i in $(seq 1 $MAX_ATTEMPTS); do
@@ -99,15 +99,27 @@ for i in $(seq 1 $MAX_ATTEMPTS); do
     FRONTEND_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000 2>/dev/null || echo "000")
 
     if [ "$BACKEND_STATUS" = "200" ] && [ "$FRONTEND_STATUS" = "200" ]; then
-        echo "=========================================================="
-        echo "  DEPLOYMENT SUCCEEDED ✓"
-        echo "  Backend API: http://127.0.0.1:8080/metrics (HTTP $BACKEND_STATUS)"
-        echo "  Frontend UI: http://127.0.0.1:3000         (HTTP $FRONTEND_STATUS)"
-        echo "=========================================================="
-        SUCCESS=1
-        break
+        METRICS_JSON=$(curl -s http://127.0.0.1:8080/metrics 2>/dev/null || echo "{}")
+        TEL_STATE=$(echo "$METRICS_JSON" | (jq -r '.telemetry_state // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN"))
+        EPS_VAL=$(echo "$METRICS_JSON" | (jq -r '.eps // "null"' 2>/dev/null || echo "null"))
+        TOTAL_INGESTED=$(echo "$METRICS_JSON" | (jq -r '.total_ingested // "0"' 2>/dev/null || echo "0"))
+
+        echo "    Status: API=$BACKEND_STATUS | Telemetry=$TEL_STATE | Ingest EPS=$EPS_VAL | Total Ingested=$TOTAL_INGESTED | Frontend=$FRONTEND_STATUS"
+
+        if [ "$TEL_STATE" = "LIVE" ]; then
+            echo "=========================================================="
+            echo "  DEPLOYMENT SUCCEEDED ✓"
+            echo "  Backend API:    http://127.0.0.1:8080/metrics (HTTP $BACKEND_STATUS, State: $TEL_STATE)"
+            echo "  Ingest Rate:    $EPS_VAL EPS (Total Ingested: $TOTAL_INGESTED)"
+            echo "  Frontend UI:    http://127.0.0.1:3000         (HTTP $FRONTEND_STATUS)"
+            echo "=========================================================="
+            SUCCESS=1
+            break
+        else
+            echo "    Telemetry state is $TEL_STATE (waiting for LIVE stream)..."
+        fi
     fi
-    sleep 2
+    sleep 3
 done
 
 if [ "$SUCCESS" -eq 0 ]; then
@@ -115,10 +127,15 @@ if [ "$SUCCESS" -eq 0 ]; then
     echo "  DEPLOYMENT HEALTH CHECK FAILED ✗"
     echo "  Backend HTTP:  $BACKEND_STATUS (expected 200)"
     echo "  Frontend HTTP: $FRONTEND_STATUS (expected 200)"
+    echo "  Telemetry:     ${TEL_STATE:-UNKNOWN} (expected LIVE)"
     echo "=========================================================="
     echo "--- Last 20 lines of serve.log ---"
     tail -n 20 "$APP_DIR/serve.log" 2>/dev/null || true
     echo "--- Last 20 lines of frontend.log ---"
     tail -n 20 "$APP_DIR/frontend.log" 2>/dev/null || true
+    echo "--- Last 20 lines of ingest.log ---"
+    tail -n 20 "$APP_DIR/ingest.log" 2>/dev/null || true
+    echo "--- Last 20 lines of demo_loop.log ---"
+    tail -n 20 "$APP_DIR/demo_loop.log" 2>/dev/null || true
     exit 1
 fi

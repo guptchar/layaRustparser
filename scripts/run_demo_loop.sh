@@ -42,41 +42,57 @@ mkdir -p "$PARQUET_DIR" "$ROOT_DIR/data/parsers"
 cleanup() {
     echo -e "\n[!] Shutting down ULPF demo supervisor..."
     pkill -P $$ 2>/dev/null || true
-    pkill -f "$GEN_BIN" 2>/dev/null || true
+    pkill -9 -f "$GEN_BIN" 2>/dev/null || true
+    pkill -9 -f "ulpf ingest" 2>/dev/null || true
     echo "[✓] Demo supervisor stopped cleanly."
     exit 0
 }
 trap cleanup SIGINT SIGTERM EXIT
 
-# Step 1: Terminate any stale ingest or generator processes
+# Step 1: Terminate any stale duplicate demo supervisor loops
+CURRENT_PID=$$
+for pid in $(pgrep -f "run_demo_loop.sh" 2>/dev/null || true); do
+    if [ "$pid" != "$CURRENT_PID" ]; then
+        echo "[!] Terminating stale demo loop supervisor PID $pid..."
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+done
+
 pkill -9 -f "ulpf ingest" 2>/dev/null || true
 pkill -9 -f "ulpf-generator" 2>/dev/null || true
 sleep 1
 
-# Step 2: Ensure ULPF Ingest Engine is running
-echo "==> [1/3] Launching ULPF Ingest Engine (UDP/TCP 5140)..."
-nohup "$ULPF_BIN" ingest \
-    --udp 0.0.0.0:5140 \
-    --tcp 0.0.0.0:5140 \
-    --parquet-dir "$PARQUET_DIR" \
-    --ledger "$LEDGER_FILE" \
-    --batch-size 1000 \
-    --batch-timeout 1000 > "$ROOT_DIR/ingest.log" 2>&1 &
-INGEST_PID=$!
-sleep 2
+# Helper to ensure ULPF Ingest Engine is running and healthy
+ensure_ingest_running() {
+    if ! pgrep -f "ulpf ingest" > /dev/null 2>&1; then
+        echo "==> [ULPF Demo Loop] Ingest engine not active. Launching ULPF Ingest (UDP/TCP 5140)..."
+        nohup "$ULPF_BIN" ingest \
+            --udp 0.0.0.0:5140 \
+            --tcp 0.0.0.0:5140 \
+            --parquet-dir "$PARQUET_DIR" \
+            --ledger "$LEDGER_FILE" \
+            --batch-size 1000 \
+            --batch-timeout 1000 >> "$ROOT_DIR/ingest.log" 2>&1 &
+        sleep 2
+        if ! pgrep -f "ulpf ingest" > /dev/null 2>&1; then
+            echo "[✗] Ingest engine failed to start. Last log lines:"
+            tail -n 10 "$ROOT_DIR/ingest.log" 2>/dev/null || true
+        else
+            echo "[✓] Ingest engine online (PID: $(pgrep -f "ulpf ingest" | tr '\n' ' '))."
+        fi
+    fi
+}
 
-if ! kill -0 "$INGEST_PID" 2>/dev/null; then
-    echo "[✗] Ingest engine failed to start. Last log lines:"
-    tail -n 10 "$ROOT_DIR/ingest.log" 2>/dev/null || true
-    exit 1
-fi
-echo "[✓] Ingest engine online (PID: $INGEST_PID)."
+# Step 2: Ensure ULPF Ingest Engine is running
+echo "==> [1/3] Initializing ULPF Ingest Engine..."
+ensure_ingest_running
 
 # Step 3: Run continuous generation replay loop
 echo "==> [2/3] Starting continuous multi-vendor replay cycles..."
 CYCLE=1
 
 while true; do
+    ensure_ingest_running
     echo "----------------------------------------------------------"
     echo "[ULPF Demo Loop] Starting replay cycle #$CYCLE (Streaming all datasets at $RATE EPS)..."
     echo "----------------------------------------------------------"
