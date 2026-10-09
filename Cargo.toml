@@ -45,7 +45,7 @@ libc = "0.2"
 # in the emitter) is against `serde_yml`, the ARCHIVED FORK people moved TO from
 # `serde_yaml`. Neither `unsafe-libyaml` nor that fork is maintained.
 # `default-features = false` drops the unused `strict-deserialise` (serde_ignored).
-noyalib = { version = "0.0.51", default-features = false, features = ["std"] }
+noyalib = { version = "0.0.52", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = 3
