@@ -1187,9 +1187,9 @@ dependencies = [
 
 [[package]]
 name = "noyalib"
-version = "0.0.52"
+version = "0.0.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18177586d8600201560a870391fa2c6b014a313caa099cf27ae133eddca69f33"
+checksum = "70b8960f9f4668b69cae4ca71106c84d38ca1ea9f41a9acc20ce55473b967849"
 dependencies = [
  "hashbrown",
  "indexmap",
@@ -1668,7 +1668,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys",
